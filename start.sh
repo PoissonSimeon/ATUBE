@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # ─── Variables ────────────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd | tr -d '\r')"
 YTDLP_BIN="/usr/local/bin/yt-dlp"
 YTDLP_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
 YTDLP_SHA_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS"
@@ -118,7 +118,7 @@ StartLimitIntervalSec=60
 Type=simple
 User=root
 ExecStart=${NODE_BIN} ${SCRIPT_DIR}/atube.js
-WorkingDirectory=${SCRIPT_DIR}
+WorkingDirectory=/tmp
 Restart=on-failure
 RestartSec=5
 
