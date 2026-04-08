@@ -1,8 +1,8 @@
 const net = require('net');
 const yts = require('yt-search');
-const ytdl = require('@distube/ytdl-core');
 const ffmpeg = require('fluent-ffmpeg');
 const { PassThrough } = require('stream');
+const { spawn } = require('child_process');
 
 // --- Configuration ---
 const PORT = 2323;
@@ -18,7 +18,7 @@ const server = net.createServer((socket) => {
     let inputBuffer = '';
     
     let currentFfmpeg = null;
-    let currentVideoStream = null;
+    let currentYtDlp = null;
 
     // Fonctions utilitaires pour le terminal
     const send = (msg) => socket.write(msg);
@@ -118,9 +118,9 @@ const server = net.createServer((socket) => {
             currentFfmpeg.kill('SIGKILL');
             currentFfmpeg = null;
         }
-        if (currentVideoStream) {
-            currentVideoStream.destroy();
-            currentVideoStream = null;
+        if (currentYtDlp) {
+            currentYtDlp.kill('SIGKILL');
+            currentYtDlp = null;
         }
     };
 
@@ -128,28 +128,39 @@ const server = net.createServer((socket) => {
         state = 'PLAYING';
         clear();
         hideCursor();
-        send('Mise en cache du flux (Appuyez sur Entrée pour arrêter)...\r\n');
+        send('Mise en cache du flux via yt-dlp (Appuyez sur Entrée pour arrêter)...\r\n');
 
         try {
-            // Utilisation du filtre 'audioandvideo' qui cible le format MP4 classique 360p.
-            // C'est le format "historique" de YouTube, souvent le seul qui ne plante pas
-            // face aux restrictions ou qui reste disponible sur toutes les vidéos.
-            currentVideoStream = ytdl(url, { 
-                filter: 'audioandvideo'
-            });
+            // Le "bidouillage" ultime : on utilise yt-dlp en sous-processus.
+            // yt-dlp est l'outil le plus à jour pour esquiver les blocages de YouTube (il simule un client Android/Web légitime).
+            currentYtDlp = spawn('yt-dlp', [
+                '-f', 'worst', // Pire qualité = ultra rapide et suffisant pour l'ASCII
+                '--quiet',     // Ne pas polluer la sortie standard
+                '--no-warnings',
+                '-o', '-',     // Rediriger le flux vidéo brut vers stdout
+                url
+            ]);
 
-            // Écouteur d'erreur spécifique pour le flux YouTube (ex: blocage par YouTube)
-            currentVideoStream.on('error', (err) => {
-                if (state === 'PLAYING') {
-                    send(`\r\nErreur de flux YouTube : ${err.message}\r\nAppuyez sur Entrée pour revenir au menu.\r\n`);
+            currentYtDlp.stderr.on('data', (data) => {
+                // yt-dlp écrit ses erreurs sur stderr
+                const errStr = data.toString();
+                if (state === 'PLAYING' && errStr.includes('ERROR:')) {
+                    send(`\r\nBlocage YouTube : ${errStr.trim()}\r\nAppuyez sur Entrée pour revenir au menu.\r\n`);
                     stopVideo();
                 }
+            });
+
+            currentYtDlp.on('error', (err) => {
+                 if (state === 'PLAYING') {
+                     send(`\r\nErreur yt-dlp (est-il installé ?) : ${err.message}\r\nAppuyez sur Entrée...\r\n`);
+                     stopVideo();
+                 }
             });
 
             const imageStream = new PassThrough();
 
             // Configuration de FFmpeg pour cracher des images brutes (rawvideo) en nuances de gris
-            currentFfmpeg = ffmpeg(currentVideoStream)
+            currentFfmpeg = ffmpeg(currentYtDlp.stdout)
                 .fps(15) // 15 images par secondes (fluide mais pas trop lourd en ASCII)
                 .size(`${WIDTH}x${HEIGHT}`)
                 .format('image2pipe')
