@@ -131,8 +131,20 @@ const server = net.createServer((socket) => {
         send('Mise en cache du flux (Appuyez sur Entrée pour arrêter)...\r\n');
 
         try {
-            // Récupère le flux audio/vidéo combiné à la qualité la plus basse (plus rapide pour générer l'ASCII)
-            currentVideoStream = ytdl(url, { quality: 'lowestvideo' });
+            // Récupère le flux avec une configuration plus stable (format permissif)
+            currentVideoStream = ytdl(url, { 
+                quality: 'lowest',
+                filter: (format) => format.hasVideo
+            });
+
+            // Écouteur d'erreur spécifique pour le flux YouTube (ex: blocage par YouTube)
+            currentVideoStream.on('error', (err) => {
+                if (state === 'PLAYING') {
+                    send(`\r\nErreur de flux YouTube : ${err.message}\r\nAppuyez sur Entrée pour revenir au menu.\r\n`);
+                    stopVideo();
+                }
+            });
+
             const imageStream = new PassThrough();
 
             // Configuration de FFmpeg pour cracher des images brutes (rawvideo) en nuances de gris
