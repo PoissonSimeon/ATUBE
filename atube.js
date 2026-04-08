@@ -227,16 +227,6 @@ const server = net.createServer((socket) => {
     promptSearch();
 
     socket.on('data', async (rawBuffer) => {
-        // --- Détection de Ctrl+C (0x03) ou Ctrl+D (0x04) ---
-        if (rawBuffer.includes(0x03) || rawBuffer.includes(0x04)) {
-            stopVideo();
-            showCursor();
-            send('\r\n\x1B[0mDéconnexion demandée. Au revoir !\r\n');
-            // On utilise destroy() pour tuer le socket instantanément (rend la main au client CLI)
-            setTimeout(() => socket.destroy(), 100); 
-            return;
-        }
-
         let pureData = Buffer.alloc(0);
         let i = 0;
         while (i < rawBuffer.length) {
@@ -261,7 +251,7 @@ const server = net.createServer((socket) => {
 
         if (str.includes('\n') || str.includes('\r')) {
             const parts = str.split(/[\r\n]+/);
-            if (parts[0]) inputBuffer += parts[0];
+            if (parts[0] && inputBuffer.length < 255) inputBuffer += parts[0];
 
             const query = inputBuffer.trim();
             inputBuffer = ''; 
@@ -329,8 +319,11 @@ const server = net.createServer((socket) => {
                     send('\b \b');
                 }
             } else {
-                inputBuffer += str;
-                send(str);
+                // Sécurité : limite la saisie pour éviter de saturer la RAM
+                if (inputBuffer.length < 255) {
+                    inputBuffer += str;
+                    send(str);
+                }
             }
         }
     });
