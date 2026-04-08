@@ -282,17 +282,10 @@ const server = net.createServer((socket) => {
     promptSearch();
 
     socket.on('data', async (rawBuffer) => {
-        // Option de sortie propre de secours
-        if (rawBuffer.includes(0x03) || rawBuffer.includes(0x04)) {
-            stopVideo();
-            showCursor();
-            send('\r\n\x1B[0mDéconnexion.\r\n');
-            setTimeout(() => socket.destroy(), 100); 
-            return;
-        }
-
         let pureData = Buffer.alloc(0);
         let i = 0;
+        
+        // 1. On filtre d'abord toutes les commandes système invisibles de Telnet (qui commencent par 255 / 0xFF)
         while (i < rawBuffer.length) {
             if (rawBuffer[i] === 255) {
                 if (i + 2 < rawBuffer.length && rawBuffer[i+1] === 250 && rawBuffer[i+2] === 31) {
@@ -308,6 +301,16 @@ const server = net.createServer((socket) => {
                 pureData = Buffer.concat([pureData, Buffer.from([rawBuffer[i]])]);
                 i++;
             }
+        }
+
+        // 2. CORRECTION : On vérifie Ctrl+C (0x03) ou Ctrl+D (0x04) UNIQUEMENT sur les données pures
+        // tapées par l'utilisateur, après avoir nettoyé le protocole Telnet.
+        if (pureData.includes(0x03) || pureData.includes(0x04)) {
+            stopVideo();
+            showCursor();
+            send('\r\n\x1B[0mDéconnexion.\r\n');
+            setTimeout(() => socket.destroy(), 100); 
+            return;
         }
 
         const str = pureData.toString();
@@ -565,18 +568,19 @@ const server = net.createServer((socket) => {
     socket.on('error', () => { handleDisconnect(); socket.destroy(); });
 });
 
-server.listen(PORT, () => {
+// CORRECTION CRUCIALE : On ajoute '0.0.0.0' pour forcer Node.js à écouter 
+// sur toutes les cartes réseau IPv4 de ton Proxmox, et pas seulement en IPv6.
+server.listen(PORT, '0.0.0.0', () => {
     console.log(`=============================================`);
     console.log(` Serveur ATUBE en écoute sur le port ${PORT} `);
     console.log(`=============================================`);
     
     // --- SÉCURITÉ ULTIME : Dégradation des privilèges ---
-    // On doit lancer le script en root pour pouvoir utiliser le port 23.
-    // Mais on abandonne immédiatement les droits root pour sécuriser ton Proxmox.
     if (process.getuid && process.getuid() === 0) {
         try {
-            // CORRECTION : On doit sortir du dossier /root AVANT de perdre les privilèges
-            // car l'utilisateur 'nobody' n'a absolument pas le droit d'exister dans /root.
+            // On nettoie l'environnement pour que les outils (yt-dlp, ffmpeg) 
+            // ne cherchent plus à lire ou écrire dans le dossier /root
+            process.env.HOME = '/tmp';
             process.chdir('/tmp');
 
             // "nobody" et "nogroup" sont les utilisateurs avec le moins de droits sous Linux
