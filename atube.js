@@ -24,7 +24,7 @@ const parseTime = (t) => {
     return hrs * 3600 + mins * 60 + secs;
 };
 
-// --- Moteur de Recherche via yt-dlp (Remplace yt-search et corrige les failles) ---
+// --- Moteur de Recherche via yt-dlp ---
 const searchYoutube = (query) => {
     return new Promise((resolve, reject) => {
         const searchProc = spawn('yt-dlp', [
@@ -54,7 +54,7 @@ const searchYoutube = (query) => {
     });
 };
 
-// --- Gestionnaire de Sous-titres (VTT) ---
+// --- Gestionnaire de Sous-titres (VTT) Amélioré ---
 const fetchSubtitles = async (url) => {
     return new Promise((resolve) => {
         const process = spawn('yt-dlp', ['-J', '--skip-download', url]);
@@ -66,15 +66,17 @@ const fetchSubtitles = async (url) => {
                 const subs = info.subtitles || {};
                 const autoSubs = info.automatic_captions || {};
                 
-                // Priorité: FR manuel > EN manuel > FR auto > EN auto > Premier dispo auto
-                let subTrack = subs['fr'] || subs['en'] || autoSubs['fr'] || autoSubs['en'];
-                if (!subTrack && Object.keys(autoSubs).length > 0) {
-                    subTrack = autoSubs[Object.keys(autoSubs)[0]];
-                }
+                // Recherche plus agressive de la piste (gère fr, fr-FR, en, etc.)
+                let subTrack = subs['fr'] || subs['fr-FR'] || subs['en'] || subs['en-US'];
+                if (!subTrack && Object.keys(subs).length > 0) subTrack = subs[Object.keys(subs)[0]];
+                
+                if (!subTrack) subTrack = autoSubs['fr'] || autoSubs['fr-FR'] || autoSubs['en'] || autoSubs['en-US'];
+                if (!subTrack && Object.keys(autoSubs).length > 0) subTrack = autoSubs[Object.keys(autoSubs)[0]];
                 
                 if (subTrack) {
-                    // Recherche d'un format texte (vtt ou srt)
-                    const format = subTrack.find(f => f.ext === 'vtt' || f.ext === 'srv1' || f.ext === 'srt') || subTrack[0];
+                    // On force absolument la recherche d'un format VTT ou SRT lisible
+                    const format = subTrack.find(f => f.ext === 'vtt') || subTrack.find(f => f.ext === 'srt');
+                    
                     if (format && format.url) {
                         const res = await fetch(format.url);
                         const text = await res.text();
@@ -85,6 +87,7 @@ const fetchSubtitles = async (url) => {
                         
                         for (let i = 0; i < lines.length; i++) {
                             const line = lines[i];
+                            // Match des timestamps VTT et SRT
                             const match = line.match(/(\d{2,}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2,}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})/);
                             if (match) {
                                 if (currentSub) parsed.push(currentSub);
@@ -93,7 +96,7 @@ const fetchSubtitles = async (url) => {
                                     end: parseTime(match[2]),
                                     text: ''
                                 };
-                            } else if (currentSub && line.trim() !== '' && !line.match(/^\d+$/)) {
+                            } else if (currentSub && line.trim() !== '' && !line.match(/^\d+$/) && !line.startsWith('WEBVTT')) {
                                 // Nettoyage des balises HTML (<c> word </c>) de YouTube auto-cap
                                 let cleanText = line.replace(/<[^>]+>/g, '').trim();
                                 if (!cleanText.startsWith('align:') && !cleanText.startsWith('STYLE')) {
@@ -105,7 +108,9 @@ const fetchSubtitles = async (url) => {
                         return resolve(parsed);
                     }
                 }
-            } catch(e) {}
+            } catch(e) {
+                console.error("Erreur parsing sous-titres :", e.message);
+            }
             resolve([]);
         });
     });
@@ -251,19 +256,19 @@ const server = net.createServer((socket) => {
         hideCursor();
         send('Mise en cache du flux et des sous-titres...\r\n');
 
-        // On adapte la hauteur pour laisser la place aux sous-titres
+        // On libère 2 lignes supplémentaires sous la vidéo (1 pour les sous-titres, 1 pour la barre)
         const videoWidth = Math.max(20, termWidth - 10);
         const videoHeight = Math.max(10, termHeight - 8); 
         const frameByteSize = videoWidth * videoHeight;
 
         const padLeft = Math.max(0, Math.floor((termWidth - videoWidth) / 2));
-        const padTop = Math.max(0, Math.floor((termHeight - videoHeight - 3) / 2));
+        const padTop = Math.max(0, Math.floor((termHeight - videoHeight - 2) / 2)); // Centrage vertical ajusté
 
         let frameQueue = [];
         let framesPlayed = 0;
         let currentSubtitles = [];
 
-        // Récupération des sous-titres en arrière-plan sans bloquer la vidéo
+        // Récupération des sous-titres
         fetchSubtitles(videoInfo.url).then(subs => {
             currentSubtitles = subs;
         });
@@ -315,7 +320,7 @@ const server = net.createServer((socket) => {
                             const charIndex = Math.floor((pixelVal / 255) * (ASCII_CHARS.length - 1));
                             asciiFrame += ASCII_CHARS[charIndex];
                         }
-                        asciiFrame += '\x1B[K\r\n';
+                        asciiFrame += '\x1B[K\r\n'; // Le \r\n final assure le saut à la ligne après chaque ligne de vidéo
                     }
                     
                     frameQueue.push(asciiFrame);
@@ -333,16 +338,11 @@ const server = net.createServer((socket) => {
                     
                     const currentSeconds = framesPlayed / FPS;
                     
-                    // Gestion de la barre de progression
-                    const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoWidth);
-                    const pBarLine = ' '.repeat(padLeft) + pBar + '\x1B[K';
-                    
-                    // Gestion des sous-titres
+                    // --- Gestion des sous-titres (Maintenant placés AVANT la barre de progression) ---
                     let subText = "";
                     if (currentSubtitles.length > 0) {
                         const activeSub = currentSubtitles.find(s => currentSeconds >= s.start && currentSeconds <= s.end);
                         if (activeSub) {
-                            // On retire les retours à la ligne pour le terminal et on limite la longueur
                             subText = activeSub.text.replace(/\n/g, ' ').trim();
                             if (subText.length > videoWidth) {
                                 subText = subText.substring(0, videoWidth - 3) + '...';
@@ -350,13 +350,18 @@ const server = net.createServer((socket) => {
                         }
                     }
                     
-                    let subLine = '\r\n\x1B[K'; // Ligne vide de base pour éviter les sauts d'écran
+                    let subLine = '\x1B[K'; // Ligne vide de base
                     if (subText) {
                         const subPad = Math.max(0, Math.floor((videoWidth - subText.length) / 2));
-                        subLine = '\r\n' + ' '.repeat(padLeft + subPad) + subText + '\x1B[K';
+                        subLine = ' '.repeat(padLeft + subPad) + subText + '\x1B[K';
                     }
 
-                    socket.write('\x1B[H' + frame + pBarLine + subLine + '\r\n\x1B[J');
+                    // --- Gestion de la barre de progression ---
+                    const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoWidth);
+                    const pBarLine = ' '.repeat(padLeft) + pBar + '\x1B[K';
+                    
+                    // Affichage final : Vidéo (\r\n inclus) + Sous-titre + \r\n + Barre + \r\n + Nettoyage de l'écran (\x1B[J)
+                    socket.write('\x1B[H' + frame + subLine + '\r\n' + pBarLine + '\r\n\x1B[J');
 
                     if (frameQueue.length < 20 && imageStream.isPaused()) {
                         imageStream.resume();
