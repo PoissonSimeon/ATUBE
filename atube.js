@@ -2,12 +2,22 @@ const net = require('net');
 const ffmpeg = require('fluent-ffmpeg');
 const { PassThrough } = require('stream');
 const { spawn } = require('child_process');
+const os = require('os');
 
 // --- Configuration Générale ---
-const PORT = 2323;
+const PORT = 23; // PORT 23 NÉCESSITE D'ÊTRE LANCÉ EN ROOT
 const ASCII_CHARS = [' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
 const FPS = 15;
 const FRAME_DELAY = 1000 / FPS;
+
+// --- Paramètres de Sécurité (Surblindage) ---
+const MAX_TOTAL_CONNECTIONS = 20; // Pas plus de 20 utilisateurs en même temps (protège ta RAM)
+const MAX_CONNECTIONS_PER_IP = 3; // Empêche un seul petit malin de tout bloquer
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes d'inactivité max
+
+// Gestion des connexions actives
+let activeConnections = 0;
+const ipTracker = new Map();
 
 // Utilitaires de Temps
 const formatTime = (secs) => {
@@ -24,15 +34,27 @@ const parseTime = (t) => {
     return hrs * 3600 + mins * 60 + secs;
 };
 
+// --- SÉCURITÉ : Nettoyage drastique des entrées utilisateur ---
+const sanitizeInput = (input) => {
+    // 1. On ne garde que les lettres, chiffres, espaces et ponctuations basiques
+    let clean = input.replace(/[^a-zA-Z0-9\s\-_.,?!'éèêàùîïô]/g, '').trim();
+    // 2. On supprime les tirets initiaux pour empêcher l'injection d'options dans yt-dlp (ex: "--exec ...")
+    while (clean.startsWith('-')) clean = clean.substring(1).trim();
+    return clean;
+};
+
 // --- Moteur de Recherche via yt-dlp ---
 const searchYoutube = (query) => {
     return new Promise((resolve, reject) => {
+        // Option shell: false est vitale pour empêcher l'injection de commandes bash
         const searchProc = spawn('yt-dlp', [
             `ytsearch20:${query}`,
             '--dump-json',
             '--default-search', 'ytsearch',
-            '--no-playlist'
-        ]);
+            '--no-playlist',
+            '--no-config', '--no-cache-dir' // Sécurité : pas de lecture de fichiers locaux
+        ], { shell: false });
+        
         let out = '';
         searchProc.stdout.on('data', d => out += d.toString());
         searchProc.on('close', code => {
@@ -57,31 +79,30 @@ const searchYoutube = (query) => {
 // --- Gestionnaire de Sous-titres (VTT) avec Déduplication (Anti-Rolling) ---
 const fetchSubtitles = async (url) => {
     return new Promise((resolve) => {
-        const process = spawn('yt-dlp', ['-J', '--skip-download', url]);
+        const process = spawn('yt-dlp', [
+            '-J', '--skip-download', '--no-config', '--no-cache-dir', url
+        ], { shell: false });
+        
         let out = '';
         process.stdout.on('data', d => out += d.toString());
         process.on('close', async () => {
             try {
                 const info = JSON.parse(out);
-                // `subtitles` = Fichiers uploadés manuellement par le créateur
-                // `automatic_captions` = Générés automatiquement par YouTube
                 const subs = info.subtitles || {};
                 const autoSubs = info.automatic_captions || {};
-                const origLang = info.language; // Langue originale de la vidéo (si détectée)
+                const origLang = info.language; 
                 
                 let subTrack = null;
                 
-                // 1. PRIORITÉ ABSOLUE : Les sous-titres originaux MANUELS
                 if (Object.keys(subs).length > 0) {
                     if (origLang && subs[origLang]) subTrack = subs[origLang];
                     else if (subs['fr']) subTrack = subs['fr'];
                     else if (subs['fr-FR']) subTrack = subs['fr-FR'];
                     else if (subs['en']) subTrack = subs['en'];
                     else if (subs['en-US']) subTrack = subs['en-US'];
-                    else subTrack = subs[Object.keys(subs)[0]]; // N'importe quel manuel dispo
+                    else subTrack = subs[Object.keys(subs)[0]]; 
                 }
                 
-                // 2. DERNIER RECOURS : Les sous-titres AUTOMATIQUES
                 if (!subTrack && Object.keys(autoSubs).length > 0) {
                     if (origLang && autoSubs[origLang]) subTrack = autoSubs[origLang];
                     else if (autoSubs['fr']) subTrack = autoSubs['fr'];
@@ -134,13 +155,10 @@ const fetchSubtitles = async (url) => {
                                 let match = true;
                                 for (let k = 0; k < j; k++) {
                                     if (prevWords[prevWords.length - j + k] !== currWords[k]) {
-                                        match = false;
-                                        break;
+                                        match = false; break;
                                     }
                                 }
-                                if (match) {
-                                    maxOverlapWords = j;
-                                }
+                                if (match) maxOverlapWords = j;
                             }
 
                             if (maxOverlapWords > 0) {
@@ -168,19 +186,42 @@ const fetchSubtitles = async (url) => {
                             }
                             groupedSubs.push(currentGroup);
                         }
-
                         return resolve(groupedSubs);
                     }
                 }
-            } catch(e) {
-                console.error("Erreur parsing sous-titres :", e.message);
-            }
+            } catch(e) {}
             resolve([]);
         });
     });
 };
 
 const server = net.createServer((socket) => {
+    // --- SÉCURITÉ : Limiteur de connexions (Anti-DDoS basique) ---
+    const clientIp = socket.remoteAddress;
+    
+    if (activeConnections >= MAX_TOTAL_CONNECTIONS) {
+        socket.write('Serveur complet. Reessayez plus tard.\r\n');
+        return socket.destroy();
+    }
+    
+    const currentIpCount = ipTracker.get(clientIp) || 0;
+    if (currentIpCount >= MAX_CONNECTIONS_PER_IP) {
+        socket.write('Trop de connexions depuis votre IP.\r\n');
+        return socket.destroy();
+    }
+
+    // Enregistrement de la connexion
+    activeConnections++;
+    ipTracker.set(clientIp, currentIpCount + 1);
+    
+    // SÉCURITÉ : Timeout d'inactivité (ferme les connexions zombies)
+    socket.setTimeout(IDLE_TIMEOUT_MS);
+    socket.on('timeout', () => {
+        if (socket.writable) socket.write('\r\nDéconnexion pour inactivité.\r\n');
+        stopVideo();
+        socket.destroy();
+    });
+
     let termWidth = 80;
     let termHeight = 24;
 
@@ -188,7 +229,6 @@ const server = net.createServer((socket) => {
     let searchResults = [];
     let inputBuffer = '';
     
-    // Variables pour la pagination
     let lastQuery = '';
     let currentPage = 0;
     
@@ -275,9 +315,11 @@ const server = net.createServer((socket) => {
 
         if (str.includes('\n') || str.includes('\r')) {
             const parts = str.split(/[\r\n]+/);
-            if (parts[0] && inputBuffer.length < 255) inputBuffer += parts[0];
+            // SÉCURITÉ : On bloque la taille du buffer pour éviter la saturation RAM (Buffer Overflow manuel)
+            if (parts[0] && inputBuffer.length < 150) inputBuffer += parts[0];
 
-            const query = inputBuffer.trim();
+            // SÉCURITÉ : Nettoyage absolu du texte
+            const query = sanitizeInput(inputBuffer);
             inputBuffer = ''; 
 
             if (state === 'PLAYING') {
@@ -343,9 +385,14 @@ const server = net.createServer((socket) => {
                     send('\b \b');
                 }
             } else {
-                if (inputBuffer.length < 255) {
-                    inputBuffer += str;
-                    send(str);
+                // SÉCURITÉ : Limite de 150 caractères pendant la saisie
+                if (inputBuffer.length < 150) {
+                    // Nettoyage en temps réel pour l'affichage visuel
+                    const cleanChar = pureData.toString().replace(/[^a-zA-Z0-9\s\-_.,?!'éèêàùîïô]/g, '');
+                    if (cleanChar) {
+                        inputBuffer += cleanChar;
+                        send(cleanChar);
+                    }
                 }
             }
         }
@@ -392,11 +439,13 @@ const server = net.createServer((socket) => {
         });
 
         try {
+            // SÉCURITÉ : Désactivation du cache, pas de shell, paramètres restrictifs
             currentYtDlp = spawn('yt-dlp', [
                 '-f', 'worst', 
                 '--quiet', '--no-warnings', '-o', '-', 
+                '--no-config', '--no-cache-dir', '--no-exec',
                 videoInfo.url
-            ]);
+            ], { shell: false });
 
             currentYtDlp.stderr.on('data', (data) => {
                 if (state === 'PLAYING' && data.toString().includes('ERROR:')) {
@@ -407,8 +456,6 @@ const server = net.createServer((socket) => {
 
             const imageStream = new PassThrough();
 
-            // MAGIE FFMPEG: On réduit de moitié la hauteur d'abord (caractères de terminal), 
-            // on adapte avec conservation du ratio, et on remplit avec du noir (centrage automatique avec -1:-1)
             currentFfmpeg = ffmpeg(currentYtDlp.stdout)
                 .fps(FPS)
                 .format('image2pipe')
@@ -501,24 +548,44 @@ const server = net.createServer((socket) => {
         }
     };
 
-    socket.on('end', () => {
+    // Gestion du nettoyage lors de la déconnexion
+    const handleDisconnect = () => {
         stopVideo();
-        socket.destroy();
-    });
+        activeConnections = Math.max(0, activeConnections - 1);
+        const currentIpCount = ipTracker.get(clientIp) || 1;
+        if (currentIpCount <= 1) {
+            ipTracker.delete(clientIp);
+        } else {
+            ipTracker.set(clientIp, currentIpCount - 1);
+        }
+    };
 
-    socket.on('close', () => {
-        stopVideo();
-        socket.destroy();
-    });
-
-    socket.on('error', (err) => {
-        stopVideo();
-        socket.destroy();
-    });
+    socket.on('end', () => { handleDisconnect(); socket.destroy(); });
+    socket.on('close', () => { handleDisconnect(); socket.destroy(); });
+    socket.on('error', () => { handleDisconnect(); socket.destroy(); });
 });
 
 server.listen(PORT, () => {
     console.log(`=============================================`);
     console.log(` Serveur ATUBE en écoute sur le port ${PORT} `);
     console.log(`=============================================`);
+    
+    // --- SÉCURITÉ ULTIME : Dégradation des privilèges ---
+    // On doit lancer le script en root pour pouvoir utiliser le port 23.
+    // Mais on abandonne immédiatement les droits root pour sécuriser ton Proxmox.
+    if (process.getuid && process.getuid() === 0) {
+        try {
+            // "nobody" et "nogroup" sont les utilisateurs avec le moins de droits sous Linux
+            process.setgid('nogroup'); 
+            process.setuid('nobody');
+            console.log('✅ SÉCURITÉ : Privilèges root abandonnés avec succès.');
+            console.log('Le serveur tourne désormais en utilisateur restreint (nobody:nogroup).');
+        } catch (err) {
+            console.error('❌ ERREUR FATALE : Impossible de dégrader les privilèges.', err);
+            process.exit(1); // On coupe tout si la sécurité échoue
+        }
+    } else {
+        console.warn('⚠️ AVERTISSEMENT : Le script n\'est pas lancé en root.');
+        console.warn('L\'écoute sur le port 23 risque d\'échouer (permission denied).');
+    }
 });
