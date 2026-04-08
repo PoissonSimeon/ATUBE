@@ -14,12 +14,10 @@ echo "[1/6] Mise à jour des paquets système..."
 apt-get update -y
 
 # 2. Installation des prérequis système
-# ffmpeg pour la vidéo, curl/wget pour les téléchargements, python3 pour yt-dlp
 echo "[2/6] Installation des dépendances système..."
 apt-get install -y ffmpeg curl wget python3
 
 # 3. Installation / Mise à jour de yt-dlp
-# Il est crucial d'avoir la dernière version de yt-dlp pour esquiver les blocages de YouTube
 echo "[3/6] Installation de yt-dlp (Dernière version)..."
 wget -qO /usr/local/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp
 chmod a+rx /usr/local/bin/yt-dlp
@@ -39,11 +37,12 @@ if [ ! -f package.json ]; then
     npm init -y > /dev/null
 fi
 
-echo "Installation des dépendances NPM (yt-search, fluent-ffmpeg)..."
-# On nettoie l'ancienne dépendance si elle est toujours là
-npm uninstall @distube/ytdl-core 2>/dev/null
-# On installe seulement ce dont on a besoin maintenant
-npm install yt-search fluent-ffmpeg
+echo "Installation de la dépendance NPM (fluent-ffmpeg)..."
+# On supprime totalement les anciennes dépendances qui causaient des failles de sécurité
+npm uninstall yt-search @distube/ytdl-core 2>/dev/null
+# On installe seulement la lib ffmpeg en laissant l'audit s'afficher normalement
+npm install fluent-ffmpeg
+npm audit fix
 
 # 6. Lancement du serveur
 echo "[6/6] Lancement du serveur ATUBE..."
