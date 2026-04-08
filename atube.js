@@ -11,16 +11,16 @@ const FPS = 15;
 const FRAME_DELAY = 1000 / FPS;
 
 // --- Paramètres de Sécurité (Surblindage) ---
-const MAX_TOTAL_CONNECTIONS = 20; // Pas plus de 20 utilisateurs en même temps (protège ta RAM)
-const MAX_CONNECTIONS_PER_IP = 3; // Empêche un seul petit malin de tout bloquer
-const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes d'inactivité max
+const MAX_TOTAL_CONNECTIONS = 20; 
+const MAX_CONNECTIONS_PER_IP = 3; 
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000; 
 
-// Gestion des connexions actives
 let activeConnections = 0;
 const ipTracker = new Map();
 
 // Utilitaires de Temps
 const formatTime = (secs) => {
+    if (secs === 0 || isNaN(secs)) return "LIVE";
     const m = Math.floor(secs / 60).toString().padStart(2, '0');
     const s = Math.floor(secs % 60).toString().padStart(2, '0');
     return `${m}:${s}`;
@@ -36,9 +36,8 @@ const parseTime = (t) => {
 
 // --- SÉCURITÉ : Nettoyage drastique des entrées utilisateur ---
 const sanitizeInput = (input) => {
-    // 1. On ne garde que les lettres, chiffres, espaces et ponctuations basiques
-    let clean = input.replace(/[^a-zA-Z0-9\s\-_.,?!'éèêàùîïô]/g, '').trim();
-    // 2. On supprime les tirets initiaux pour empêcher l'injection d'options dans yt-dlp (ex: "--exec ...")
+    // Élargi pour accepter tous les accents standards européens, bloque les injections (<, >, &, |, $, ;, \`)
+    let clean = input.replace(/[^a-zA-Z0-9\s\-_.,?!'éèêëàâäùûüîïôöçñ¿¡+]/g, '').trim();
     while (clean.startsWith('-')) clean = clean.substring(1).trim();
     return clean;
 };
@@ -46,14 +45,13 @@ const sanitizeInput = (input) => {
 // --- Moteur de Recherche via yt-dlp ---
 const searchYoutube = (query) => {
     return new Promise((resolve, reject) => {
-        // Option shell: false est vitale pour empêcher l'injection de commandes bash
         const searchProc = spawn('yt-dlp', [
             `ytsearch20:${query}`,
             '--dump-json',
             '--default-search', 'ytsearch',
             '--no-playlist',
-            '--no-config', '--no-cache-dir' // Sécurité : pas de lecture de fichiers locaux
-        ], { shell: false, cwd: '/tmp' }); // CORRECTION : Forcer l'exécution dans /tmp
+            '--no-config', '--no-cache-dir' 
+        ], { shell: false, cwd: '/tmp' }); 
         
         let out = '';
         searchProc.stdout.on('data', d => out += d.toString());
@@ -62,11 +60,13 @@ const searchYoutube = (query) => {
             const results = out.trim().split('\n').map(line => {
                 try {
                     const data = JSON.parse(line);
+                    const isLive = data.is_live || data.duration === 0;
                     return {
                         title: data.title,
                         url: data.webpage_url,
-                        timestamp: formatTime(data.duration || 0),
-                        seconds: data.duration || 0
+                        timestamp: isLive ? 'LIVE' : formatTime(data.duration),
+                        seconds: data.duration || 0,
+                        isLive: isLive
                     };
                 } catch(e) { return null; }
             }).filter(r => r !== null);
@@ -81,7 +81,7 @@ const fetchSubtitles = async (url) => {
     return new Promise((resolve) => {
         const process = spawn('yt-dlp', [
             '-J', '--skip-download', '--no-config', '--no-cache-dir', url
-        ], { shell: false, cwd: '/tmp' }); // CORRECTION : Forcer l'exécution dans /tmp
+        ], { shell: false, cwd: '/tmp' }); 
         
         let out = '';
         process.stdout.on('data', d => out += d.toString());
@@ -196,7 +196,6 @@ const fetchSubtitles = async (url) => {
 };
 
 const server = net.createServer((socket) => {
-    // --- SÉCURITÉ : Limiteur de connexions (Anti-DDoS basique) ---
     const clientIp = socket.remoteAddress;
     
     if (activeConnections >= MAX_TOTAL_CONNECTIONS) {
@@ -210,11 +209,9 @@ const server = net.createServer((socket) => {
         return socket.destroy();
     }
 
-    // Enregistrement de la connexion
     activeConnections++;
     ipTracker.set(clientIp, currentIpCount + 1);
     
-    // SÉCURITÉ : Timeout d'inactivité (ferme les connexions zombies)
     socket.setTimeout(IDLE_TIMEOUT_MS);
     socket.on('timeout', () => {
         if (socket.writable) socket.write('\r\nDéconnexion pour inactivité.\r\n');
@@ -269,7 +266,8 @@ const server = net.createServer((socket) => {
         
         for (let i = start; i < end; i++) {
             const v = searchResults[i];
-            send(`[${i - start + 1}] ${v.title} (${v.timestamp})\r\n`);
+            const displayTime = v.isLive ? '[EN DIRECT]' : `(${v.timestamp})`;
+            send(`[${i - start + 1}] ${v.title} ${displayTime}\r\n`);
         }
         
         send('\r\n');
@@ -285,7 +283,6 @@ const server = net.createServer((socket) => {
         let pureData = Buffer.alloc(0);
         let i = 0;
         
-        // 1. On filtre d'abord toutes les commandes système invisibles de Telnet (qui commencent par 255 / 0xFF)
         while (i < rawBuffer.length) {
             if (rawBuffer[i] === 255) {
                 if (i + 2 < rawBuffer.length && rawBuffer[i+1] === 250 && rawBuffer[i+2] === 31) {
@@ -303,8 +300,6 @@ const server = net.createServer((socket) => {
             }
         }
 
-        // 2. CORRECTION : On vérifie Ctrl+C (0x03) ou Ctrl+D (0x04) UNIQUEMENT sur les données pures
-        // tapées par l'utilisateur, après avoir nettoyé le protocole Telnet.
         if (pureData.includes(0x03) || pureData.includes(0x04)) {
             stopVideo();
             showCursor();
@@ -318,10 +313,8 @@ const server = net.createServer((socket) => {
 
         if (str.includes('\n') || str.includes('\r')) {
             const parts = str.split(/[\r\n]+/);
-            // SÉCURITÉ : On bloque la taille du buffer pour éviter la saturation RAM (Buffer Overflow manuel)
             if (parts[0] && inputBuffer.length < 150) inputBuffer += parts[0];
 
-            // SÉCURITÉ : Nettoyage absolu du texte
             const query = sanitizeInput(inputBuffer);
             inputBuffer = ''; 
 
@@ -388,10 +381,8 @@ const server = net.createServer((socket) => {
                     send('\b \b');
                 }
             } else {
-                // SÉCURITÉ : Limite de 150 caractères pendant la saisie
                 if (inputBuffer.length < 150) {
-                    // Nettoyage en temps réel pour l'affichage visuel
-                    const cleanChar = pureData.toString().replace(/[^a-zA-Z0-9\s\-_.,?!'éèêàùîïô]/g, '');
+                    const cleanChar = pureData.toString().replace(/[^a-zA-Z0-9\s\-_.,?!'éèêëàâäùûüîïôöçñ¿¡+]/g, '');
                     if (cleanChar) {
                         inputBuffer += cleanChar;
                         send(cleanChar);
@@ -407,7 +398,13 @@ const server = net.createServer((socket) => {
         if (currentYtDlp) { currentYtDlp.kill('SIGKILL'); currentYtDlp = null; }
     };
 
-    const generateProgressBar = (currentSecs, totalSecs, width) => {
+    const generateProgressBar = (currentSecs, totalSecs, isLive, width) => {
+        if (isLive) {
+            const liveStr = " [ DIRECT ] ";
+            const padding = Math.max(0, Math.floor((width - liveStr.length) / 2));
+            return ' '.repeat(padding) + liveStr + ' '.repeat(padding);
+        }
+
         const timeStr = ` ${formatTime(currentSecs)} / ${formatTime(totalSecs)} `;
         const barWidth = width - timeStr.length - 2; 
         
@@ -442,13 +439,12 @@ const server = net.createServer((socket) => {
         });
 
         try {
-            // SÉCURITÉ : Désactivation du cache, pas de shell, paramètres restrictifs
             currentYtDlp = spawn('yt-dlp', [
                 '-f', 'worst', 
                 '--quiet', '--no-warnings', '-o', '-', 
                 '--no-config', '--no-cache-dir', '--no-exec',
                 videoInfo.url
-            ], { shell: false, cwd: '/tmp' }); // CORRECTION : Forcer l'exécution dans /tmp
+            ], { shell: false, cwd: '/tmp' }); 
 
             currentYtDlp.stderr.on('data', (data) => {
                 if (state === 'PLAYING' && data.toString().includes('ERROR:')) {
@@ -468,9 +464,7 @@ const server = net.createServer((socket) => {
                     '-vf', `scale=iw:ih/2,scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=decrease,pad=${videoWidth}:${videoHeight}:-1:-1`
                 ])
                 .on('error', (err) => {
-                    if (err.message && !err.message.includes('SIGKILL')) {
-                        console.error('\r\nErreur interne FFmpeg:', err.message);
-                    }
+                    // Ignorer les erreurs silencieuses
                 });
 
             currentFfmpeg.pipe(imageStream);
@@ -534,7 +528,7 @@ const server = net.createServer((socket) => {
                         subLine = ' '.repeat(padLeft + subPad) + subText + '\x1B[K';
                     }
 
-                    const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoWidth);
+                    const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoInfo.isLive, videoWidth);
                     const pBarLine = ' '.repeat(padLeft) + pBar + '\x1B[K';
                     
                     socket.write('\x1B[H' + frame + subLine + '\r\n' + pBarLine + '\r\n\x1B[J');
@@ -551,7 +545,6 @@ const server = net.createServer((socket) => {
         }
     };
 
-    // Gestion du nettoyage lors de la déconnexion
     const handleDisconnect = () => {
         stopVideo();
         activeConnections = Math.max(0, activeConnections - 1);
@@ -568,29 +561,23 @@ const server = net.createServer((socket) => {
     socket.on('error', () => { handleDisconnect(); socket.destroy(); });
 });
 
-// CORRECTION CRUCIALE : On ajoute '0.0.0.0' pour forcer Node.js à écouter 
-// sur toutes les cartes réseau IPv4 de ton Proxmox, et pas seulement en IPv6.
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`=============================================`);
     console.log(` Serveur ATUBE en écoute sur le port ${PORT} `);
     console.log(`=============================================`);
     
-    // --- SÉCURITÉ ULTIME : Dégradation des privilèges ---
     if (process.getuid && process.getuid() === 0) {
         try {
-            // On nettoie l'environnement pour que les outils (yt-dlp, ffmpeg) 
-            // ne cherchent plus à lire ou écrire dans le dossier /root
             process.env.HOME = '/tmp';
             process.chdir('/tmp');
 
-            // "nobody" et "nogroup" sont les utilisateurs avec le moins de droits sous Linux
             process.setgid('nogroup'); 
             process.setuid('nobody');
             console.log('✅ SÉCURITÉ : Privilèges root abandonnés avec succès.');
             console.log('Le serveur tourne désormais en utilisateur restreint (nobody:nogroup).');
         } catch (err) {
             console.error('❌ ERREUR FATALE : Impossible de dégrader les privilèges.', err);
-            process.exit(1); // On coupe tout si la sécurité échoue
+            process.exit(1); 
         }
     } else {
         console.warn('⚠️ AVERTISSEMENT : Le script n\'est pas lancé en root.');
