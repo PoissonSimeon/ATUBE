@@ -131,10 +131,11 @@ const server = net.createServer((socket) => {
         send('Mise en cache du flux (Appuyez sur Entrée pour arrêter)...\r\n');
 
         try {
-            // Récupère le flux avec une configuration plus stable (format permissif)
+            // Utilisation du filtre 'audioandvideo' qui cible le format MP4 classique 360p.
+            // C'est le format "historique" de YouTube, souvent le seul qui ne plante pas
+            // face aux restrictions ou qui reste disponible sur toutes les vidéos.
             currentVideoStream = ytdl(url, { 
-                quality: 'lowest',
-                filter: (format) => format.hasVideo
+                filter: 'audioandvideo'
             });
 
             // Écouteur d'erreur spécifique pour le flux YouTube (ex: blocage par YouTube)
