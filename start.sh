@@ -81,7 +81,6 @@ echo "      fluent-ffmpeg OK"
 
 # ─── 5. Pare-feu : ouverture du port Telnet ──────────────────────────────────
 echo "[5/6] Configuration du pare-feu (port ${TELNET_PORT})..."
-
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q 'active'; then
     ufw allow "${TELNET_PORT}/tcp" comment 'ATUBE Telnet' >/dev/null
     echo "      Port ${TELNET_PORT} ouvert via ufw OK"
@@ -119,7 +118,7 @@ StartLimitIntervalSec=60
 Type=simple
 User=root
 ExecStart=${NODE_BIN} ${SCRIPT_DIR}/atube.js
-WorkingDirectory=/tmp
+WorkingDirectory=${SCRIPT_DIR}
 Restart=on-failure
 RestartSec=5
 
@@ -147,7 +146,14 @@ systemctl start "${SERVICE_NAME}"
 # ─── Vérification finale ──────────────────────────────────────────────────────
 echo ""
 echo "--- Verification ---"
-sleep 2
+
+# attendre quelques secondes que le service démarre réellement
+for i in {1..5}; do
+    if systemctl is-active --quiet "${SERVICE_NAME}"; then
+        break
+    fi
+    sleep 1
+done
 
 if ! systemctl is-active --quiet "${SERVICE_NAME}"; then
     echo "ERREUR : Le service n'a pas demarré. Logs :"
