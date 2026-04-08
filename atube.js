@@ -54,7 +54,7 @@ const searchYoutube = (query) => {
     });
 };
 
-// --- Gestionnaire de Sous-titres (VTT) Amélioré ---
+// --- Gestionnaire de Sous-titres (VTT) avec Déduplication (Anti-Rolling) ---
 const fetchSubtitles = async (url) => {
     return new Promise((resolve) => {
         const process = spawn('yt-dlp', ['-J', '--skip-download', url]);
@@ -66,7 +66,7 @@ const fetchSubtitles = async (url) => {
                 const subs = info.subtitles || {};
                 const autoSubs = info.automatic_captions || {};
                 
-                // Recherche plus agressive de la piste (gère fr, fr-FR, en, etc.)
+                // Priorité au Français, sinon Anglais
                 let subTrack = subs['fr'] || subs['fr-FR'] || subs['en'] || subs['en-US'];
                 if (!subTrack && Object.keys(subs).length > 0) subTrack = subs[Object.keys(subs)[0]];
                 
@@ -74,7 +74,6 @@ const fetchSubtitles = async (url) => {
                 if (!subTrack && Object.keys(autoSubs).length > 0) subTrack = autoSubs[Object.keys(autoSubs)[0]];
                 
                 if (subTrack) {
-                    // On force absolument la recherche d'un format VTT ou SRT lisible
                     const format = subTrack.find(f => f.ext === 'vtt') || subTrack.find(f => f.ext === 'srt');
                     
                     if (format && format.url) {
@@ -87,7 +86,6 @@ const fetchSubtitles = async (url) => {
                         
                         for (let i = 0; i < lines.length; i++) {
                             const line = lines[i];
-                            // Match des timestamps VTT et SRT
                             const match = line.match(/(\d{2,}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2,}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})/);
                             if (match) {
                                 if (currentSub) parsed.push(currentSub);
@@ -97,7 +95,6 @@ const fetchSubtitles = async (url) => {
                                     text: ''
                                 };
                             } else if (currentSub && line.trim() !== '' && !line.match(/^\d+$/) && !line.startsWith('WEBVTT')) {
-                                // Nettoyage des balises HTML (<c> word </c>) de YouTube auto-cap
                                 let cleanText = line.replace(/<[^>]+>/g, '').trim();
                                 if (!cleanText.startsWith('align:') && !cleanText.startsWith('STYLE')) {
                                     currentSub.text += (currentSub.text ? ' ' : '') + cleanText;
@@ -105,7 +102,42 @@ const fetchSubtitles = async (url) => {
                             }
                         }
                         if (currentSub) parsed.push(currentSub);
-                        return resolve(parsed);
+
+                        // --- ALGORITHME DE DÉDUPLICATION (ANTI-ROLLING) ---
+                        // YouTube répète les phrases dans ses auto-captions. On va supprimer ces répétitions.
+                        parsed.forEach(sub => sub.originalText = sub.text);
+
+                        for (let i = 1; i < parsed.length; i++) {
+                            let prevWords = parsed[i-1].originalText.trim().split(/\s+/);
+                            let currWords = parsed[i].originalText.trim().split(/\s+/);
+
+                            let maxOverlapWords = 0;
+                            let maxSearch = Math.min(prevWords.length, currWords.length);
+
+                            // Cherche le plus grand suffixe commun (fin du précédent = début de l'actuel)
+                            for (let j = 1; j <= maxSearch; j++) {
+                                let match = true;
+                                for (let k = 0; k < j; k++) {
+                                    if (prevWords[prevWords.length - j + k] !== currWords[k]) {
+                                        match = false;
+                                        break;
+                                    }
+                                }
+                                if (match) {
+                                    maxOverlapWords = j;
+                                }
+                            }
+
+                            // Si on trouve une superposition, on coupe l'ancienne partie du texte actuel
+                            if (maxOverlapWords > 0) {
+                                currWords.splice(0, maxOverlapWords);
+                                parsed[i].text = currWords.join(' ');
+                            }
+                        }
+
+                        // On nettoie les sous-titres devenus complètement vides
+                        const finalParsed = parsed.filter(sub => sub.text.trim().length > 0);
+                        return resolve(finalParsed);
                     }
                 }
             } catch(e) {
@@ -256,19 +288,17 @@ const server = net.createServer((socket) => {
         hideCursor();
         send('Mise en cache du flux et des sous-titres...\r\n');
 
-        // On libère 2 lignes supplémentaires sous la vidéo (1 pour les sous-titres, 1 pour la barre)
         const videoWidth = Math.max(20, termWidth - 10);
         const videoHeight = Math.max(10, termHeight - 8); 
         const frameByteSize = videoWidth * videoHeight;
 
         const padLeft = Math.max(0, Math.floor((termWidth - videoWidth) / 2));
-        const padTop = Math.max(0, Math.floor((termHeight - videoHeight - 2) / 2)); // Centrage vertical ajusté
+        const padTop = Math.max(0, Math.floor((termHeight - videoHeight - 2) / 2));
 
         let frameQueue = [];
         let framesPlayed = 0;
         let currentSubtitles = [];
 
-        // Récupération des sous-titres
         fetchSubtitles(videoInfo.url).then(subs => {
             currentSubtitles = subs;
         });
@@ -320,7 +350,7 @@ const server = net.createServer((socket) => {
                             const charIndex = Math.floor((pixelVal / 255) * (ASCII_CHARS.length - 1));
                             asciiFrame += ASCII_CHARS[charIndex];
                         }
-                        asciiFrame += '\x1B[K\r\n'; // Le \r\n final assure le saut à la ligne après chaque ligne de vidéo
+                        asciiFrame += '\x1B[K\r\n';
                     }
                     
                     frameQueue.push(asciiFrame);
@@ -338,11 +368,13 @@ const server = net.createServer((socket) => {
                     
                     const currentSeconds = framesPlayed / FPS;
                     
-                    // --- Gestion des sous-titres (Maintenant placés AVANT la barre de progression) ---
+                    // --- Affichage des sous-titres ---
                     let subText = "";
                     if (currentSubtitles.length > 0) {
-                        const activeSub = currentSubtitles.find(s => currentSeconds >= s.start && currentSeconds <= s.end);
-                        if (activeSub) {
+                        // On prend systématiquement le bloc LE PLUS RÉCENT pour une coupure nette de l'ancien
+                        const activeSubs = currentSubtitles.filter(s => currentSeconds >= s.start && currentSeconds <= s.end);
+                        if (activeSubs.length > 0) {
+                            const activeSub = activeSubs[activeSubs.length - 1];
                             subText = activeSub.text.replace(/\n/g, ' ').trim();
                             if (subText.length > videoWidth) {
                                 subText = subText.substring(0, videoWidth - 3) + '...';
@@ -350,17 +382,16 @@ const server = net.createServer((socket) => {
                         }
                     }
                     
-                    let subLine = '\x1B[K'; // Ligne vide de base
+                    let subLine = '\x1B[K'; 
                     if (subText) {
                         const subPad = Math.max(0, Math.floor((videoWidth - subText.length) / 2));
                         subLine = ' '.repeat(padLeft + subPad) + subText + '\x1B[K';
                     }
 
-                    // --- Gestion de la barre de progression ---
                     const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoWidth);
                     const pBarLine = ' '.repeat(padLeft) + pBar + '\x1B[K';
                     
-                    // Affichage final : Vidéo (\r\n inclus) + Sous-titre + \r\n + Barre + \r\n + Nettoyage de l'écran (\x1B[J)
+                    // Affichage final centré verticalement : Vidéo -> Sous-Titre -> Barre
                     socket.write('\x1B[H' + frame + subLine + '\r\n' + pBarLine + '\r\n\x1B[J');
 
                     if (frameQueue.length < 20 && imageStream.isPaused()) {
