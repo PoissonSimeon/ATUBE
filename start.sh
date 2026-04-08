@@ -37,4 +37,4 @@ npm install yt-search @distube/ytdl-core fluent-ffmpeg
 
 # 5. Lancement du serveur
 echo "[5/5] Lancement du serveur ASCIITUBE..."
-node ASCIITUBE.js
+node atube.js
