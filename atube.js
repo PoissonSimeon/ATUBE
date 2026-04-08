@@ -167,8 +167,8 @@ const server = net.createServer((socket) => {
         send('Mise en cache du flux via yt-dlp...\r\n');
 
         // On adapte la résolution vidéo à la taille réelle du terminal de l'utilisateur
-        // On retire 1 à la hauteur pour laisser la place de dessiner la barre de progression sans faire défiler l'écran
-        const videoWidth = termWidth;
+        // On retire 1 en hauteur ET en largeur pour éviter le "retour à la ligne automatique" du terminal
+        const videoWidth = Math.max(20, termWidth - 1);
         const videoHeight = Math.max(10, termHeight - 1); 
         const frameByteSize = videoWidth * videoHeight;
 
@@ -235,7 +235,8 @@ const server = net.createServer((socket) => {
                     framesPlayed++;
                     
                     const currentSeconds = framesPlayed / FPS;
-                    const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, termWidth);
+                    // On donne videoWidth à la barre de progression pour qu'elle ne touche pas le bord non plus
+                    const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoWidth);
                     
                     // On efface le caractère clignotant, on se replace en haut à gauche et on affiche l'image + la barre
                     socket.write('\x1B[H' + frame + pBar);
