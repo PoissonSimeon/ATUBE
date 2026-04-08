@@ -1,5 +1,4 @@
 const net = require('net');
-const yts = require('yt-search');
 const ffmpeg = require('fluent-ffmpeg');
 const { PassThrough } = require('stream');
 const { spawn } = require('child_process');
@@ -10,12 +9,113 @@ const ASCII_CHARS = [' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
 const FPS = 15;
 const FRAME_DELAY = 1000 / FPS;
 
+// Utilitaires de Temps
+const formatTime = (secs) => {
+    const m = Math.floor(secs / 60).toString().padStart(2, '0');
+    const s = Math.floor(secs % 60).toString().padStart(2, '0');
+    return `${m}:${s}`;
+};
+
+const parseTime = (t) => {
+    const parts = t.split(':');
+    let secs = parseFloat(parts.pop().replace(',', '.')); 
+    let mins = parseInt(parts.pop() || '0');
+    let hrs = parseInt(parts.pop() || '0');
+    return hrs * 3600 + mins * 60 + secs;
+};
+
+// --- Moteur de Recherche via yt-dlp (Remplace yt-search et corrige les failles) ---
+const searchYoutube = (query) => {
+    return new Promise((resolve, reject) => {
+        const searchProc = spawn('yt-dlp', [
+            `ytsearch5:${query}`,
+            '--dump-json',
+            '--default-search', 'ytsearch',
+            '--no-playlist'
+        ]);
+        let out = '';
+        searchProc.stdout.on('data', d => out += d.toString());
+        searchProc.on('close', code => {
+            if (code !== 0 && out.length === 0) return reject(new Error('Search failed'));
+            const results = out.trim().split('\n').map(line => {
+                try {
+                    const data = JSON.parse(line);
+                    return {
+                        title: data.title,
+                        url: data.webpage_url,
+                        timestamp: formatTime(data.duration || 0),
+                        seconds: data.duration || 0
+                    };
+                } catch(e) { return null; }
+            }).filter(r => r !== null);
+            resolve(results);
+        });
+        searchProc.on('error', reject);
+    });
+};
+
+// --- Gestionnaire de Sous-titres (VTT) ---
+const fetchSubtitles = async (url) => {
+    return new Promise((resolve) => {
+        const process = spawn('yt-dlp', ['-J', '--skip-download', url]);
+        let out = '';
+        process.stdout.on('data', d => out += d.toString());
+        process.on('close', async () => {
+            try {
+                const info = JSON.parse(out);
+                const subs = info.subtitles || {};
+                const autoSubs = info.automatic_captions || {};
+                
+                // Priorité: FR manuel > EN manuel > FR auto > EN auto > Premier dispo auto
+                let subTrack = subs['fr'] || subs['en'] || autoSubs['fr'] || autoSubs['en'];
+                if (!subTrack && Object.keys(autoSubs).length > 0) {
+                    subTrack = autoSubs[Object.keys(autoSubs)[0]];
+                }
+                
+                if (subTrack) {
+                    // Recherche d'un format texte (vtt ou srt)
+                    const format = subTrack.find(f => f.ext === 'vtt' || f.ext === 'srv1' || f.ext === 'srt') || subTrack[0];
+                    if (format && format.url) {
+                        const res = await fetch(format.url);
+                        const text = await res.text();
+                        
+                        const parsed = [];
+                        const lines = text.split(/\r?\n/);
+                        let currentSub = null;
+                        
+                        for (let i = 0; i < lines.length; i++) {
+                            const line = lines[i];
+                            const match = line.match(/(\d{2,}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2,}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})/);
+                            if (match) {
+                                if (currentSub) parsed.push(currentSub);
+                                currentSub = {
+                                    start: parseTime(match[1]),
+                                    end: parseTime(match[2]),
+                                    text: ''
+                                };
+                            } else if (currentSub && line.trim() !== '' && !line.match(/^\d+$/)) {
+                                // Nettoyage des balises HTML (<c> word </c>) de YouTube auto-cap
+                                let cleanText = line.replace(/<[^>]+>/g, '').trim();
+                                if (!cleanText.startsWith('align:') && !cleanText.startsWith('STYLE')) {
+                                    currentSub.text += (currentSub.text ? ' ' : '') + cleanText;
+                                }
+                            }
+                        }
+                        if (currentSub) parsed.push(currentSub);
+                        return resolve(parsed);
+                    }
+                }
+            } catch(e) {}
+            resolve([]);
+        });
+    });
+};
+
 const server = net.createServer((socket) => {
-    // Dimensions par défaut, mises à jour via Telnet NAWS
     let termWidth = 80;
     let termHeight = 24;
 
-    let state = 'SEARCH'; // SEARCH, SELECT, PLAYING
+    let state = 'SEARCH';
     let searchResults = [];
     let inputBuffer = '';
     
@@ -23,13 +123,11 @@ const server = net.createServer((socket) => {
     let currentYtDlp = null;
     let playInterval = null;
 
-    // Utilitaires d'affichage
     const send = (msg) => socket.write(msg);
     const clear = () => send('\x1B[2J\x1B[H');
     const hideCursor = () => send('\x1B[?25l');
     const showCursor = () => send('\x1B[?25h');
 
-    // Demande au client Telnet de communiquer la taille de sa fenêtre (RFC 1073 - NAWS)
     socket.write(Buffer.from([255, 253, 31])); 
 
     const promptSearch = () => {
@@ -46,21 +144,19 @@ const server = net.createServer((socket) => {
     promptSearch();
 
     socket.on('data', async (rawBuffer) => {
-        // --- Parseur Telnet (Extraction de la commande NAWS et nettoyage des entrées) ---
         let pureData = Buffer.alloc(0);
         let i = 0;
         while (i < rawBuffer.length) {
-            if (rawBuffer[i] === 255) { // Si c'est le code Telnet IAC (Interpret As Command)
+            if (rawBuffer[i] === 255) {
                 if (i + 2 < rawBuffer.length && rawBuffer[i+1] === 250 && rawBuffer[i+2] === 31) {
-                    // C'est une réponse NAWS (Subnegotiation Window Size)
                     if (i + 8 < rawBuffer.length) {
                         termWidth = rawBuffer.readUInt16BE(i + 3);
                         termHeight = rawBuffer.readUInt16BE(i + 5);
-                        i += 9; // On saute tout le bloc de négociation
+                        i += 9;
                     } else break;
                 } else if (i + 1 < rawBuffer.length && rawBuffer[i+1] >= 251 && rawBuffer[i+1] <= 254) {
-                    i += 3; // Saute DO/DONT/WILL/WONT
-                } else i += 2; // Saute une commande Telnet standard
+                    i += 3;
+                } else i += 2;
             } else {
                 pureData = Buffer.concat([pureData, Buffer.from([rawBuffer[i]])]);
                 i++;
@@ -68,9 +164,8 @@ const server = net.createServer((socket) => {
         }
 
         const str = pureData.toString();
-        if (!str) return; // Si la trame ne contenait que des commandes système Telnet, on s'arrête là
+        if (!str) return;
 
-        // --- Logique utilisateur ---
         if (str.includes('\n') || str.includes('\r')) {
             const parts = str.split(/[\r\n]+/);
             if (parts[0]) inputBuffer += parts[0];
@@ -94,8 +189,7 @@ const server = net.createServer((socket) => {
                 if (!query) { promptSearch(); return; }
                 send('\r\n\r\nRecherche en cours pour "' + query + '"...\r\n');
                 try {
-                    const r = await yts(query);
-                    searchResults = r.videos.slice(0, 5);
+                    searchResults = await searchYoutube(query);
                     
                     clear();
                     send('Résultats pour : ' + query + '\r\n\r\n');
@@ -114,7 +208,6 @@ const server = net.createServer((socket) => {
                 if (choice === 0) {
                     promptSearch();
                 } else if (choice > 0 && choice <= searchResults.length) {
-                    // On passe l'objet vidéo entier pour avoir accès à sa durée
                     playVideo(searchResults[choice - 1]);
                 } else {
                     send('\r\nChoix invalide. Choisissez un numéro (0-5) : ');
@@ -139,24 +232,16 @@ const server = net.createServer((socket) => {
         if (currentYtDlp) { currentYtDlp.kill('SIGKILL'); currentYtDlp = null; }
     };
 
-    // Formatage du temps pour la barre de progression (ex: 01:25)
-    const formatTime = (secs) => {
-        const m = Math.floor(secs / 60).toString().padStart(2, '0');
-        const s = Math.floor(secs % 60).toString().padStart(2, '0');
-        return `${m}:${s}`;
-    };
-
     const generateProgressBar = (currentSecs, totalSecs, width) => {
         const timeStr = ` ${formatTime(currentSecs)} / ${formatTime(totalSecs)} `;
         const barWidth = width - timeStr.length - 2; 
         
-        if (barWidth < 5) return timeStr.padStart(width, ' '); // Si le terminal est minuscule
+        if (barWidth < 5) return timeStr.padStart(width, ' '); 
 
         const progress = totalSecs > 0 ? Math.min(currentSecs / totalSecs, 1) : 0;
         const filled = Math.floor(barWidth * progress);
         const empty = barWidth - filled;
         
-        // Ex: [======>        ] 01:20 / 03:40
         return '[' + '='.repeat(filled) + '>'.repeat(empty > 0 ? 1 : 0) + ' '.repeat(Math.max(0, empty - 1)) + ']' + timeStr;
     };
 
@@ -164,19 +249,24 @@ const server = net.createServer((socket) => {
         state = 'PLAYING';
         clear();
         hideCursor();
-        send('Mise en cache du flux via yt-dlp...\r\n');
+        send('Mise en cache du flux et des sous-titres...\r\n');
 
-        // On adapte la résolution vidéo avec des marges pour centrer et éviter le clignotement
+        // On adapte la hauteur pour laisser la place aux sous-titres
         const videoWidth = Math.max(20, termWidth - 10);
-        const videoHeight = Math.max(10, termHeight - 6); 
+        const videoHeight = Math.max(10, termHeight - 8); 
         const frameByteSize = videoWidth * videoHeight;
 
-        // Calcul dynamique des marges pour centrer la vidéo
         const padLeft = Math.max(0, Math.floor((termWidth - videoWidth) / 2));
-        const padTop = Math.max(0, Math.floor((termHeight - videoHeight - 2) / 2));
+        const padTop = Math.max(0, Math.floor((termHeight - videoHeight - 3) / 2));
 
         let frameQueue = [];
         let framesPlayed = 0;
+        let currentSubtitles = [];
+
+        // Récupération des sous-titres en arrière-plan sans bloquer la vidéo
+        fetchSubtitles(videoInfo.url).then(subs => {
+            currentSubtitles = subs;
+        });
 
         try {
             currentYtDlp = spawn('yt-dlp', [
@@ -201,7 +291,6 @@ const server = net.createServer((socket) => {
                 .videoCodec('rawvideo')
                 .outputOptions('-pix_fmt gray')
                 .on('error', (err) => {
-                    // On capture et ignore silencieusement l'erreur quand on coupe la vidéo de force
                     if (err.message && !err.message.includes('SIGKILL')) {
                         console.error('\r\nErreur interne FFmpeg:', err.message);
                     }
@@ -218,28 +307,25 @@ const server = net.createServer((socket) => {
                     const frameData = frameBuffer.subarray(0, frameByteSize);
                     frameBuffer = frameBuffer.subarray(frameByteSize);
 
-                    let asciiFrame = '\r\n'.repeat(padTop); // Marge en haut
+                    let asciiFrame = '\r\n'.repeat(padTop); 
                     for (let y = 0; y < videoHeight; y++) {
-                        asciiFrame += ' '.repeat(padLeft); // Marge à gauche
+                        asciiFrame += ' '.repeat(padLeft);
                         for (let x = 0; x < videoWidth; x++) {
                             const pixelVal = frameData[y * videoWidth + x];
                             const charIndex = Math.floor((pixelVal / 255) * (ASCII_CHARS.length - 1));
                             asciiFrame += ASCII_CHARS[charIndex];
                         }
-                        // \x1B[K nettoie la fin de la ligne pour éviter les artefacts visuels
                         asciiFrame += '\x1B[K\r\n';
                     }
                     
                     frameQueue.push(asciiFrame);
 
-                    // Si on a généré trop d'images d'avance, on met FFmpeg en pause pour économiser la RAM
                     if (frameQueue.length > 60) {
                         imageStream.pause();
                     }
                 }
             });
 
-            // Boucle d'affichage cadencée précisément pour correspondre aux FPS (Vitesse normale)
             playInterval = setInterval(() => {
                 if (frameQueue.length > 0) {
                     const frame = frameQueue.shift();
@@ -247,14 +333,31 @@ const server = net.createServer((socket) => {
                     
                     const currentSeconds = framesPlayed / FPS;
                     
+                    // Gestion de la barre de progression
                     const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoWidth);
                     const pBarLine = ' '.repeat(padLeft) + pBar + '\x1B[K';
                     
-                    // \x1B[H : Curseur en haut à gauche
-                    // \x1B[J : Nettoie le bas de l'écran pour éliminer les restes de lignes sans clignoter
-                    socket.write('\x1B[H' + frame + pBarLine + '\r\n\x1B[J');
+                    // Gestion des sous-titres
+                    let subText = "";
+                    if (currentSubtitles.length > 0) {
+                        const activeSub = currentSubtitles.find(s => currentSeconds >= s.start && currentSeconds <= s.end);
+                        if (activeSub) {
+                            // On retire les retours à la ligne pour le terminal et on limite la longueur
+                            subText = activeSub.text.replace(/\n/g, ' ').trim();
+                            if (subText.length > videoWidth) {
+                                subText = subText.substring(0, videoWidth - 3) + '...';
+                            }
+                        }
+                    }
+                    
+                    let subLine = '\r\n\x1B[K'; // Ligne vide de base pour éviter les sauts d'écran
+                    if (subText) {
+                        const subPad = Math.max(0, Math.floor((videoWidth - subText.length) / 2));
+                        subLine = '\r\n' + ' '.repeat(padLeft + subPad) + subText + '\x1B[K';
+                    }
 
-                    // Quand le tampon se vide, on réveille FFmpeg
+                    socket.write('\x1B[H' + frame + pBarLine + subLine + '\r\n\x1B[J');
+
                     if (frameQueue.length < 20 && imageStream.isPaused()) {
                         imageStream.resume();
                     }
