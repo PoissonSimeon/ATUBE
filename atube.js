@@ -63,14 +63,33 @@ const fetchSubtitles = async (url) => {
         process.on('close', async () => {
             try {
                 const info = JSON.parse(out);
+                // `subtitles` = Fichiers uploadés manuellement par le créateur
+                // `automatic_captions` = Générés automatiquement par YouTube
                 const subs = info.subtitles || {};
                 const autoSubs = info.automatic_captions || {};
+                const origLang = info.language; // Langue originale de la vidéo (si détectée)
                 
-                let subTrack = subs['fr'] || subs['fr-FR'] || subs['en'] || subs['en-US'];
-                if (!subTrack && Object.keys(subs).length > 0) subTrack = subs[Object.keys(subs)[0]];
+                let subTrack = null;
                 
-                if (!subTrack) subTrack = autoSubs['fr'] || autoSubs['fr-FR'] || autoSubs['en'] || autoSubs['en-US'];
-                if (!subTrack && Object.keys(autoSubs).length > 0) subTrack = autoSubs[Object.keys(autoSubs)[0]];
+                // 1. PRIORITÉ ABSOLUE : Les sous-titres originaux MANUELS
+                if (Object.keys(subs).length > 0) {
+                    if (origLang && subs[origLang]) subTrack = subs[origLang];
+                    else if (subs['fr']) subTrack = subs['fr'];
+                    else if (subs['fr-FR']) subTrack = subs['fr-FR'];
+                    else if (subs['en']) subTrack = subs['en'];
+                    else if (subs['en-US']) subTrack = subs['en-US'];
+                    else subTrack = subs[Object.keys(subs)[0]]; // N'importe quel manuel dispo
+                }
+                
+                // 2. DERNIER RECOURS : Les sous-titres AUTOMATIQUES
+                if (!subTrack && Object.keys(autoSubs).length > 0) {
+                    if (origLang && autoSubs[origLang]) subTrack = autoSubs[origLang];
+                    else if (autoSubs['fr']) subTrack = autoSubs['fr'];
+                    else if (autoSubs['fr-FR']) subTrack = autoSubs['fr-FR'];
+                    else if (autoSubs['en']) subTrack = autoSubs['en'];
+                    else if (autoSubs['en-US']) subTrack = autoSubs['en-US'];
+                    else subTrack = autoSubs[Object.keys(autoSubs)[0]];
+                }
                 
                 if (subTrack) {
                     const format = subTrack.find(f => f.ext === 'vtt') || subTrack.find(f => f.ext === 'srt');
