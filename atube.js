@@ -1,586 +1,506 @@
-const net = require('net');
-const ffmpeg = require('fluent-ffmpeg');
+'use strict';
+
+const net     = require('net');
+const ffmpeg  = require('fluent-ffmpeg');
 const { PassThrough } = require('stream');
-const { spawn } = require('child_process');
-const os = require('os');
+const { spawn }       = require('child_process');
 
-// --- Configuration Générale ---
-const PORT = 23; // PORT 23 NÉCESSITE D'ÊTRE LANCÉ EN ROOT
-const ASCII_CHARS = [' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
-const FPS = 15;
-const FRAME_DELAY = 1000 / FPS;
+// ─── Configuration ────────────────────────────────────────────────────────────
+const PORT                   = 23;
+const FPS                    = 15;
+const FRAME_DELAY_MS         = 1000 / FPS;
+const MAX_TOTAL_CONNECTIONS  = 20;
+const MAX_CONNECTIONS_PER_IP = 3;
+const IDLE_TIMEOUT_MS        = 5 * 60 * 1000;
+const MAX_INPUT_LEN          = 120;
+const MAX_YTDLP_BUFFER       = 8 * 1024 * 1024; // 8 MB
+const MAX_FRAME_QUEUE        = 60;
+const MIN_FRAME_QUEUE        = 20;
+const SEARCH_COOLDOWN_MS     = 2000;
+const YTDLP                  = '/usr/local/bin/yt-dlp';
+const YTDLP_BASE_ARGS        = ['--no-config', '--no-cache-dir', '--no-warnings', '--no-playlist'];
+const YOUTUBE_URL_RE         = /^https:\/\/(www\.youtube\.com\/(watch\?v=|shorts\/)|youtu\.be\/)[\w-]{11}/;
+const ASCII_CHARS            = ' .:-=+*#%@';
 
-// --- Paramètres de Sécurité (Surblindage) ---
-const MAX_TOTAL_CONNECTIONS = 20; 
-const MAX_CONNECTIONS_PER_IP = 3; 
-const IDLE_TIMEOUT_MS = 5 * 60 * 1000; 
-
+// ─── Global state ─────────────────────────────────────────────────────────────
 let activeConnections = 0;
-const ipTracker = new Map();
+const ipConnections   = new Map();
 
-// Utilitaires de Temps
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 const formatTime = (secs) => {
-    if (secs === 0 || isNaN(secs)) return "LIVE";
-    const m = Math.floor(secs / 60).toString().padStart(2, '0');
-    const s = Math.floor(secs % 60).toString().padStart(2, '0');
-    return `${m}:${s}`;
+    if (!secs || isNaN(secs)) return 'LIVE';
+    return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(Math.floor(secs % 60)).padStart(2, '0')}`;
 };
 
-const parseTime = (t) => {
+const parseTimecode = (t) => {
     const parts = t.split(':');
-    let secs = parseFloat(parts.pop().replace(',', '.')); 
-    let mins = parseInt(parts.pop() || '0');
-    let hrs = parseInt(parts.pop() || '0');
-    return hrs * 3600 + mins * 60 + secs;
+    const s = parseFloat(parts.pop().replace(',', '.'));
+    const m = parseInt(parts.pop() || '0', 10);
+    const h = parseInt(parts.pop() || '0', 10);
+    return h * 3600 + m * 60 + s;
 };
 
-// --- SÉCURITÉ : Nettoyage drastique des entrées utilisateur ---
-const sanitizeInput = (input) => {
-    // Élargi pour accepter tous les accents standards européens, bloque les injections (<, >, &, |, $, ;, \`)
-    let clean = input.replace(/[^a-zA-Z0-9\s\-_.,?!'éèêëàâäùûüîïôöçñ¿¡+]/g, '').trim();
-    while (clean.startsWith('-')) clean = clean.substring(1).trim();
-    return clean;
+const sanitize = (input) => {
+    let s = input.replace(/[^a-zA-Z0-9\s\-_.,?!'éèêëàâäùûüîïôöçñ¿¡+]/g, '').trim();
+    while (s.startsWith('-')) s = s.slice(1).trim();
+    return s;
 };
 
-// --- Moteur de Recherche via yt-dlp ---
-const searchYoutube = (query) => {
-    return new Promise((resolve, reject) => {
-        const searchProc = spawn('yt-dlp', [
-            `ytsearch20:${query}`,
-            '--dump-json',
-            '--default-search', 'ytsearch',
-            '--no-playlist',
-            '--no-config', '--no-cache-dir' 
-        ], { shell: false, cwd: '/tmp' }); 
-        
-        let out = '';
-        searchProc.stdout.on('data', d => out += d.toString());
-        searchProc.on('close', code => {
-            if (code !== 0 && out.length === 0) return reject(new Error('Search failed'));
-            const results = out.trim().split('\n').map(line => {
-                try {
-                    const data = JSON.parse(line);
-                    const isLive = data.is_live || data.duration === 0;
-                    return {
-                        title: data.title,
-                        url: data.webpage_url,
-                        timestamp: isLive ? 'LIVE' : formatTime(data.duration),
-                        seconds: data.duration || 0,
-                        isLive: isLive
-                    };
-                } catch(e) { return null; }
-            }).filter(r => r !== null);
-            resolve(results);
-        });
-        searchProc.on('error', reject);
-    });
-};
+const isValidYTUrl = (url) => typeof url === 'string' && YOUTUBE_URL_RE.test(url);
 
-// --- Gestionnaire de Sous-titres (VTT) avec Déduplication (Anti-Rolling) ---
-const fetchSubtitles = async (url) => {
-    return new Promise((resolve) => {
-        const process = spawn('yt-dlp', [
-            '-J', '--skip-download', '--no-config', '--no-cache-dir', url
-        ], { shell: false, cwd: '/tmp' }); 
-        
-        let out = '';
-        process.stdout.on('data', d => out += d.toString());
-        process.on('close', async () => {
-            try {
-                const info = JSON.parse(out);
-                const subs = info.subtitles || {};
-                const autoSubs = info.automatic_captions || {};
-                const origLang = info.language; 
-                
-                let subTrack = null;
-                
-                if (Object.keys(subs).length > 0) {
-                    if (origLang && subs[origLang]) subTrack = subs[origLang];
-                    else if (subs['fr']) subTrack = subs['fr'];
-                    else if (subs['fr-FR']) subTrack = subs['fr-FR'];
-                    else if (subs['en']) subTrack = subs['en'];
-                    else if (subs['en-US']) subTrack = subs['en-US'];
-                    else subTrack = subs[Object.keys(subs)[0]]; 
-                }
-                
-                if (!subTrack && Object.keys(autoSubs).length > 0) {
-                    if (origLang && autoSubs[origLang]) subTrack = autoSubs[origLang];
-                    else if (autoSubs['fr']) subTrack = autoSubs['fr'];
-                    else if (autoSubs['fr-FR']) subTrack = autoSubs['fr-FR'];
-                    else if (autoSubs['en']) subTrack = autoSubs['en'];
-                    else if (autoSubs['en-US']) subTrack = autoSubs['en-US'];
-                    else subTrack = autoSubs[Object.keys(autoSubs)[0]];
-                }
-                
-                if (subTrack) {
-                    const format = subTrack.find(f => f.ext === 'vtt') || subTrack.find(f => f.ext === 'srt');
-                    
-                    if (format && format.url) {
-                        const res = await fetch(format.url);
-                        const text = await res.text();
-                        
-                        const parsed = [];
-                        const lines = text.split(/\r?\n/);
-                        let currentSub = null;
-                        
-                        for (let i = 0; i < lines.length; i++) {
-                            const line = lines[i];
-                            const match = line.match(/(\d{2,}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2,}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})/);
-                            if (match) {
-                                if (currentSub) parsed.push(currentSub);
-                                currentSub = {
-                                    start: parseTime(match[1]),
-                                    end: parseTime(match[2]),
-                                    text: ''
-                                };
-                            } else if (currentSub && line.trim() !== '' && !line.match(/^\d+$/) && !line.startsWith('WEBVTT')) {
-                                let cleanText = line.replace(/<[^>]+>/g, '').trim();
-                                if (!cleanText.startsWith('align:') && !cleanText.startsWith('STYLE')) {
-                                    currentSub.text += (currentSub.text ? ' ' : '') + cleanText;
-                                }
-                            }
-                        }
-                        if (currentSub) parsed.push(currentSub);
-
-                        parsed.forEach(sub => sub.originalText = sub.text);
-
-                        for (let i = 1; i < parsed.length; i++) {
-                            let prevWords = parsed[i-1].originalText.trim().split(/\s+/);
-                            let currWords = parsed[i].originalText.trim().split(/\s+/);
-
-                            let maxOverlapWords = 0;
-                            let maxSearch = Math.min(prevWords.length, currWords.length);
-
-                            for (let j = 1; j <= maxSearch; j++) {
-                                let match = true;
-                                for (let k = 0; k < j; k++) {
-                                    if (prevWords[prevWords.length - j + k] !== currWords[k]) {
-                                        match = false; break;
-                                    }
-                                }
-                                if (match) maxOverlapWords = j;
-                            }
-
-                            if (maxOverlapWords > 0) {
-                                currWords.splice(0, maxOverlapWords);
-                                parsed[i].text = currWords.join(' ');
-                            }
-                        }
-
-                        const finalParsed = parsed.filter(sub => sub.text.trim().length > 0);
-                        
-                        const groupedSubs = [];
-                        if (finalParsed.length > 0) {
-                            let currentGroup = { ...finalParsed[0] };
-                            for (let i = 1; i < finalParsed.length; i++) {
-                                const nextSub = finalParsed[i];
-                                const gap = nextSub.start - currentGroup.end;
-                                
-                                if (gap < 1.5 && (currentGroup.text.length + nextSub.text.length) < 70) {
-                                    currentGroup.text += ' ' + nextSub.text;
-                                    currentGroup.end = Math.max(currentGroup.end, nextSub.end);
-                                } else {
-                                    groupedSubs.push(currentGroup);
-                                    currentGroup = { ...nextSub };
-                                }
-                            }
-                            groupedSubs.push(currentGroup);
-                        }
-                        return resolve(groupedSubs);
-                    }
-                }
-            } catch(e) {}
-            resolve([]);
-        });
-    });
-};
-
-const server = net.createServer((socket) => {
-    const clientIp = socket.remoteAddress;
-    
-    if (activeConnections >= MAX_TOTAL_CONNECTIONS) {
-        socket.write('Serveur complet. Reessayez plus tard.\r\n');
-        return socket.destroy();
+const makeProgressBar = (cur, total, isLive, width) => {
+    if (isLive) {
+        const s = ' [ EN DIRECT ] ';
+        return s.padStart(Math.floor((width + s.length) / 2)).padEnd(width);
     }
-    
-    const currentIpCount = ipTracker.get(clientIp) || 0;
-    if (currentIpCount >= MAX_CONNECTIONS_PER_IP) {
-        socket.write('Trop de connexions depuis votre IP.\r\n');
-        return socket.destroy();
+    const timeStr = ` ${formatTime(cur)} / ${formatTime(total)} `;
+    const barW    = width - timeStr.length - 2;
+    if (barW < 4) return timeStr.slice(0, width);
+    const fill  = Math.floor(barW * Math.min(cur / Math.max(total, 1), 1));
+    const empty = barW - fill;
+    return '[' + '='.repeat(fill) + (empty > 0 ? '>' : '') + ' '.repeat(Math.max(0, empty - 1)) + ']' + timeStr;
+};
+
+// ─── YouTube Search ───────────────────────────────────────────────────────────
+const searchYouTube = (query) => new Promise((resolve, reject) => {
+    const proc = spawn(YTDLP, [
+        `ytsearch20:${query}`, '--dump-json', '--default-search', 'ytsearch',
+        ...YTDLP_BASE_ARGS,
+    ], { shell: false, cwd: '/tmp' });
+
+    let raw = '';
+    let capped = false;
+
+    proc.stdout.on('data', (chunk) => {
+        if (capped) return;
+        raw += chunk.toString();
+        if (raw.length > MAX_YTDLP_BUFFER) { capped = true; proc.kill('SIGTERM'); }
+    });
+
+    proc.on('close', () => {
+        const results = raw.trim().split('\n').flatMap((line) => {
+            try {
+                const d = JSON.parse(line);
+                if (!isValidYTUrl(d.webpage_url)) return [];
+                const live = !!(d.is_live || d.duration === 0);
+                return [{ title: String(d.title || '(Sans titre)').slice(0, 100), url: d.webpage_url,
+                          timestamp: live ? 'LIVE' : formatTime(d.duration),
+                          seconds: d.duration || 0, isLive: live }];
+            } catch { return []; }
+        });
+        resolve(results);
+    });
+
+    proc.on('error', reject);
+    proc.stderr.resume(); // drain stderr without buffering
+});
+
+// ─── Subtitle Fetcher ─────────────────────────────────────────────────────────
+const fetchSubtitles = (url) => new Promise((resolve) => {
+    if (!isValidYTUrl(url)) return resolve([]);
+
+    const proc = spawn(YTDLP, ['-J', '--skip-download', ...YTDLP_BASE_ARGS, url], { shell: false, cwd: '/tmp' });
+
+    let raw = '';
+    let capped = false;
+
+    proc.stdout.on('data', (chunk) => {
+        if (capped) return;
+        raw += chunk.toString();
+        if (raw.length > MAX_YTDLP_BUFFER) { capped = true; proc.kill('SIGTERM'); }
+    });
+
+    proc.on('close', () => {
+        try {
+            const info = JSON.parse(raw);
+            const subs = info.subtitles || {};
+            const auto = info.automatic_captions || {};
+            const lang = info.language;
+            const PREFS = [lang, 'fr', 'fr-FR', 'en', 'en-US'].filter(Boolean);
+
+            let track = null;
+            for (const l of PREFS) if (subs[l]) { track = subs[l]; break; }
+            if (!track) for (const l of PREFS) if (auto[l]) { track = auto[l]; break; }
+            if (!track && Object.keys(subs).length) track = subs[Object.keys(subs)[0]];
+            if (!track && Object.keys(auto).length) track = auto[Object.keys(auto)[0]];
+            if (!track) return resolve([]);
+
+            const fmt = track.find(f => f.ext === 'vtt') || track.find(f => f.ext === 'srt');
+            if (!fmt?.url) return resolve([]);
+
+            fetch(fmt.url)
+                .then(r => r.text())
+                .then(text => resolve(parseSubs(text)))
+                .catch(() => resolve([]));
+        } catch { resolve([]); }
+    });
+
+    proc.on('error', () => resolve([]));
+    proc.stderr.resume();
+});
+
+const parseSubs = (text) => {
+    const lines  = text.split(/\r?\n/);
+    const parsed = [];
+    let cur      = null;
+
+    for (const line of lines) {
+        const m = line.match(/(\d{2,}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})\s*-->\s*(\d{2,}:\d{2}:\d{2}[.,]\d{3}|\d{2}:\d{2}[.,]\d{3})/);
+        if (m) {
+            if (cur) parsed.push(cur);
+            cur = { start: parseTimecode(m[1]), end: parseTimecode(m[2]), text: '' };
+        } else if (cur && line.trim() && !/^\d+$/.test(line) &&
+                   !line.startsWith('WEBVTT') && !line.startsWith('align:') && !line.startsWith('STYLE')) {
+            const t = line.replace(/<[^>]+>/g, '').trim();
+            if (t) cur.text += (cur.text ? ' ' : '') + t;
+        }
+    }
+    if (cur) parsed.push(cur);
+
+    // Anti-rolling: remove word overlap with previous subtitle
+    for (let i = 1; i < parsed.length; i++) {
+        const prev = parsed[i - 1].text.split(/\s+/);
+        const curr = parsed[i].text.split(/\s+/);
+        let overlap = 0;
+        for (let j = 1; j <= Math.min(prev.length, curr.length); j++) {
+            if (prev.slice(-j).join(' ') === curr.slice(0, j).join(' ')) overlap = j;
+        }
+        if (overlap) parsed[i].text = curr.slice(overlap).join(' ');
+    }
+
+    // Group nearby subtitles into readable chunks
+    const grouped = [];
+    for (const sub of parsed.filter(s => s.text.trim())) {
+        const last = grouped[grouped.length - 1];
+        if (last && (sub.start - last.end) < 1.5 && (last.text.length + sub.text.length) < 70) {
+            last.text += ' ' + sub.text;
+            last.end   = Math.max(last.end, sub.end);
+        } else {
+            grouped.push({ ...sub });
+        }
+    }
+    return grouped;
+};
+
+// ─── TCP Server ───────────────────────────────────────────────────────────────
+const server = net.createServer((socket) => {
+    const ip = socket.remoteAddress || 'unknown';
+
+    // ── Connection limits ──────────────────────────────────────────────────────
+    if (activeConnections >= MAX_TOTAL_CONNECTIONS) {
+        socket.end('Serveur complet. Reessayez plus tard.\r\n');
+        return;
+    }
+    const ipCount = ipConnections.get(ip) || 0;
+    if (ipCount >= MAX_CONNECTIONS_PER_IP) {
+        socket.end('Trop de connexions depuis votre IP.\r\n');
+        return;
     }
 
     activeConnections++;
-    ipTracker.set(clientIp, currentIpCount + 1);
-    
+    ipConnections.set(ip, ipCount + 1);
+
     socket.setTimeout(IDLE_TIMEOUT_MS);
-    socket.on('timeout', () => {
-        if (socket.writable) socket.write('\r\nDéconnexion pour inactivité.\r\n');
-        stopVideo();
-        socket.destroy();
-    });
+    socket.on('timeout', () => { write('\r\nDéconnexion pour inactivité.\r\n'); destroy(); });
+    socket.on('error', () => {}); // handled via 'close'
 
-    let termWidth = 80;
-    let termHeight = 24;
+    // ── Terminal dimensions ────────────────────────────────────────────────────
+    let termW = 80, termH = 24;
 
-    let state = 'SEARCH';
-    let searchResults = [];
-    let inputBuffer = '';
-    
-    let lastQuery = '';
-    let currentPage = 0;
-    
-    let currentFfmpeg = null;
-    let currentYtDlp = null;
+    // ── App state ──────────────────────────────────────────────────────────────
+    let state       = 'SEARCH';
+    let results     = [];
+    let lastQuery   = '';
+    let page        = 0;
+    let inputBuf    = '';
+    let lastSearch  = 0; // timestamp for rate-limiting searches
+
+    // ── Playback resources ─────────────────────────────────────────────────────
+    let ytDlpProc    = null;
+    let ffmpegProc   = null;
+    let imgStream    = null;
     let playInterval = null;
 
-    const send = (msg) => {
-        if (!socket.destroyed && socket.writable) {
-            socket.write(msg);
-        }
-    };
-    
-    const clear = () => send('\x1B[2J\x1B[H');
-    const hideCursor = () => send('\x1B[?25l');
-    const showCursor = () => send('\x1B[?25h');
+    // ── Helpers ────────────────────────────────────────────────────────────────
+    const write      = (data) => { if (!socket.destroyed && socket.writable) socket.write(data); };
+    const clear      = ()     => write('\x1B[2J\x1B[H');
+    const hideCursor = ()     => write('\x1B[?25l');
+    const showCursor = ()     => write('\x1B[?25h');
+    const destroy    = ()     => { if (!socket.destroyed) socket.destroy(); };
 
-    socket.write(Buffer.from([255, 253, 31])); 
-
-    const promptSearch = () => {
+    // ── UI ─────────────────────────────────────────────────────────────────────
+    const showSearch = () => {
         showCursor();
         clear();
-        send('================================================================================\r\n');
-        send('                                *** ATUBE *** \r\n');
-        send('                      YouTube directement dans ton CLI                          \r\n');
-        send('================================================================================\r\n\r\n');
-        send('Entrez votre recherche YouTube (ou "quit" pour quitter) : ');
+        write('================================================================================\r\n');
+        write('                                 *** ATUBE ***\r\n');
+        write('                       YouTube directement dans ton CLI\r\n');
+        write('================================================================================\r\n\r\n');
+        write('Recherche YouTube (ou "quit" pour quitter) : ');
         state = 'SEARCH';
     };
 
-    const displayResults = () => {
+    const showResults = () => {
         clear();
-        const totalPages = Math.ceil(searchResults.length / 5);
-        send(`Résultats pour : "${lastQuery}" (Page ${currentPage + 1}/${totalPages})\r\n\r\n`);
-        
-        const start = currentPage * 5;
-        const end = Math.min(start + 5, searchResults.length);
-        
-        for (let i = start; i < end; i++) {
-            const v = searchResults[i];
-            const displayTime = v.isLive ? '[EN DIRECT]' : `(${v.timestamp})`;
-            send(`[${i - start + 1}] ${v.title} ${displayTime}\r\n`);
+        const totalPages = Math.ceil(results.length / 5);
+        write(`Résultats pour : "${lastQuery}" (Page ${page + 1}/${totalPages})\r\n\r\n`);
+        const start = page * 5;
+        for (let i = start; i < Math.min(start + 5, results.length); i++) {
+            const v = results[i];
+            write(`[${i - start + 1}] ${v.title} ${v.isLive ? '[EN DIRECT]' : `(${v.timestamp})`}\r\n`);
         }
-        
-        send('\r\n');
-        if (end < searchResults.length) send('[n] Page suivante\r\n');
-        if (currentPage > 0) send('[p] Page précédente\r\n');
-        send('[0] Nouvelle recherche\r\n\r\n');
-        send('Choisissez une option : ');
+        write('\r\n');
+        if ((page + 1) * 5 < results.length) write('[n] Page suivante\r\n');
+        if (page > 0)                         write('[p] Page précédente\r\n');
+        write('[0] Nouvelle recherche\r\n\r\nChoisissez une option : ');
+        state = 'SELECT';
     };
 
-    promptSearch();
+    // Negotiate terminal size via Telnet NAWS
+    socket.write(Buffer.from([0xFF, 0xFD, 0x1F])); // IAC DO NAWS
+    showSearch();
 
-    socket.on('data', async (rawBuffer) => {
-        let pureData = Buffer.alloc(0);
+    // ── Input handler ──────────────────────────────────────────────────────────
+    socket.on('data', async (raw) => {
+        // Parse Telnet IAC sequences, extract pure data bytes
+        let pure = [];
         let i = 0;
-        
-        while (i < rawBuffer.length) {
-            if (rawBuffer[i] === 255) {
-                if (i + 2 < rawBuffer.length && rawBuffer[i+1] === 250 && rawBuffer[i+2] === 31) {
-                    if (i + 8 < rawBuffer.length) {
-                        termWidth = rawBuffer.readUInt16BE(i + 3);
-                        termHeight = rawBuffer.readUInt16BE(i + 5);
-                        i += 9;
-                    } else break;
-                } else if (i + 1 < rawBuffer.length && rawBuffer[i+1] >= 251 && rawBuffer[i+1] <= 254) {
+        while (i < raw.length) {
+            if (raw[i] === 0xFF) {
+                const cmd = raw[i + 1];
+                if (cmd === 0xFA && raw[i + 2] === 0x1F && i + 8 < raw.length) {
+                    // IAC SB NAWS W1 W0 H1 H0 IAC SE  (9 bytes)
+                    termW = raw.readUInt16BE(i + 3);
+                    termH = raw.readUInt16BE(i + 5);
+                    i += 9;
+                } else if (cmd >= 0xFB && cmd <= 0xFE && i + 2 < raw.length) {
+                    // IAC WILL/WONT/DO/DONT <option>  (3 bytes)
                     i += 3;
-                } else i += 2;
+                } else {
+                    i += 2;
+                }
             } else {
-                pureData = Buffer.concat([pureData, Buffer.from([rawBuffer[i]])]);
+                pure.push(raw[i]);
                 i++;
             }
         }
 
-        if (pureData.includes(0x03) || pureData.includes(0x04)) {
-            stopVideo();
+        if (!pure.length) return;
+        const buf = Buffer.from(pure);
+
+        // Ctrl+C / Ctrl+D → disconnect
+        if (buf.includes(0x03) || buf.includes(0x04)) {
+            stopPlayback();
             showCursor();
-            send('\r\n\x1B[0mDéconnexion.\r\n');
-            setTimeout(() => socket.destroy(), 100); 
+            write('\r\nAu revoir !\r\n');
+            setTimeout(destroy, 100);
             return;
         }
 
-        const str = pureData.toString();
-        if (!str) return;
+        const str = buf.toString('utf8');
 
-        if (str.includes('\n') || str.includes('\r')) {
-            const parts = str.split(/[\r\n]+/);
-            if (parts[0] && inputBuffer.length < 150) inputBuffer += parts[0];
+        // Backspace
+        if (buf.length === 1 && (buf[0] === 0x08 || buf[0] === 0x7F)) {
+            if (inputBuf.length > 0) { inputBuf = inputBuf.slice(0, -1); write('\b \b'); }
+            return;
+        }
 
-            const query = sanitizeInput(inputBuffer);
-            inputBuffer = ''; 
+        if (str.includes('\r') || str.includes('\n')) {
+            const before = str.split(/[\r\n]/)[0];
+            if (before && inputBuf.length < MAX_INPUT_LEN) inputBuf += before;
+            const query = sanitize(inputBuf);
+            inputBuf = '';
 
-            if (state === 'PLAYING') {
-                stopVideo();
-                promptSearch();
-                return;
-            }
+            if (state === 'PLAYING') { stopPlayback(); showSearch(); return; }
 
-            if (query.toLowerCase() === 'quit' || query.toLowerCase() === 'exit') {
-                send('\r\nAu revoir !\r\n');
-                socket.destroy();
-                return;
-            }
+            if (query === 'quit' || query === 'exit') { write('\r\nAu revoir !\r\n'); destroy(); return; }
 
             if (state === 'SEARCH') {
-                if (!query) { promptSearch(); return; }
-                send('\r\n\r\nRecherche en cours pour "' + query + '"...\r\n');
+                if (!query) { showSearch(); return; }
+                const now = Date.now();
+                if (now - lastSearch < SEARCH_COOLDOWN_MS) {
+                    write('\r\nRecherche trop rapide. Veuillez patienter...\r\n');
+                    return;
+                }
+                lastSearch = now;
+                write(`\r\n\r\nRecherche en cours pour "${query}"...\r\n`);
                 try {
-                    searchResults = await searchYoutube(query);
+                    results   = await searchYouTube(query);
                     lastQuery = query;
-                    currentPage = 0;
-                    
-                    if (searchResults.length > 0) {
-                        state = 'SELECT';
-                        displayResults();
-                    } else {
-                        send('\r\nAucun résultat trouvé. Appuyez sur Entrée pour réessayer.\r\n');
-                        state = 'SEARCH';
-                    }
-                } catch (e) {
-                    send('\r\nErreur lors de la recherche. Appuyez sur Entrée pour réessayer.\r\n');
-                    state = 'SEARCH';
+                    page      = 0;
+                    if (results.length) { showResults(); }
+                    else { write('\r\nAucun résultat. Appuyez sur Entrée pour réessayer.\r\n'); }
+                } catch {
+                    write('\r\nErreur de recherche. Appuyez sur Entrée pour réessayer.\r\n');
                 }
-            } else if (state === 'SELECT') {
-                const qLower = query.toLowerCase();
-                
-                if (query === '0') {
-                    promptSearch();
-                } else if ((qLower === 'n' || qLower === 'next') && (currentPage + 1) * 5 < searchResults.length) {
-                    currentPage++;
-                    displayResults();
-                } else if ((qLower === 'p' || qLower === 'prev') && currentPage > 0) {
-                    currentPage--;
-                    displayResults();
-                } else {
-                    const choice = parseInt(query);
-                    if (choice >= 1 && choice <= 5) {
-                        const absIndex = currentPage * 5 + (choice - 1);
-                        if (absIndex < searchResults.length) {
-                            playVideo(searchResults[absIndex]);
-                        } else {
-                            send('\r\nChoix invalide. Choisissez une option : ');
-                        }
-                    } else {
-                        send('\r\nChoix invalide. Choisissez une option : ');
-                    }
+                return;
+            }
+
+            if (state === 'SELECT') {
+                if (query === '0') { showSearch(); return; }
+                if (query.toLowerCase() === 'n' && (page + 1) * 5 < results.length) { page++; showResults(); return; }
+                if (query.toLowerCase() === 'p' && page > 0) { page--; showResults(); return; }
+                const n = parseInt(query, 10);
+                if (n >= 1 && n <= 5) {
+                    const idx = page * 5 + (n - 1);
+                    if (idx < results.length) { startPlayback(results[idx]); return; }
                 }
+                write('\r\nChoix invalide. Choisissez une option : ');
             }
         } else {
-            if (pureData[0] === 0x08 || pureData[0] === 0x7f) { 
-                if (inputBuffer.length > 0) {
-                    inputBuffer = inputBuffer.slice(0, -1);
-                    send('\b \b');
-                }
-            } else {
-                if (inputBuffer.length < 150) {
-                    const cleanChar = pureData.toString().replace(/[^a-zA-Z0-9\s\-_.,?!'éèêëàâäùûüîïôöçñ¿¡+]/g, '');
-                    if (cleanChar) {
-                        inputBuffer += cleanChar;
-                        send(cleanChar);
-                    }
-                }
+            // Character echo during input
+            if (state !== 'PLAYING' && inputBuf.length < MAX_INPUT_LEN) {
+                const c = sanitize(str);
+                if (c) { inputBuf += c; write(c); }
             }
         }
     });
 
-    const stopVideo = () => {
+    // ── Playback ───────────────────────────────────────────────────────────────
+    const stopPlayback = () => {
         if (playInterval) { clearInterval(playInterval); playInterval = null; }
-        if (currentFfmpeg) { currentFfmpeg.kill('SIGKILL'); currentFfmpeg = null; }
-        if (currentYtDlp) { currentYtDlp.kill('SIGKILL'); currentYtDlp = null; }
+        if (imgStream)    { imgStream.destroy();          imgStream    = null; }
+        if (ffmpegProc)   { ffmpegProc.kill('SIGKILL');   ffmpegProc   = null; }
+        if (ytDlpProc)    { ytDlpProc.kill('SIGKILL');    ytDlpProc    = null; }
     };
 
-    const generateProgressBar = (currentSecs, totalSecs, isLive, width) => {
-        if (isLive) {
-            const liveStr = " [ DIRECT ] ";
-            const padding = Math.max(0, Math.floor((width - liveStr.length) / 2));
-            return ' '.repeat(padding) + liveStr + ' '.repeat(padding);
-        }
-
-        const timeStr = ` ${formatTime(currentSecs)} / ${formatTime(totalSecs)} `;
-        const barWidth = width - timeStr.length - 2; 
-        
-        if (barWidth < 5) return timeStr.padStart(width, ' '); 
-
-        const progress = totalSecs > 0 ? Math.min(currentSecs / totalSecs, 1) : 0;
-        const filled = Math.floor(barWidth * progress);
-        const empty = barWidth - filled;
-        
-        return '[' + '='.repeat(filled) + '>'.repeat(empty > 0 ? 1 : 0) + ' '.repeat(Math.max(0, empty - 1)) + ']' + timeStr;
-    };
-
-    const playVideo = (videoInfo) => {
+    const startPlayback = (video) => {
         state = 'PLAYING';
         clear();
         hideCursor();
-        send('Mise en cache du flux et des sous-titres...\r\n');
+        write('Chargement du flux...\r\n');
 
-        const videoWidth = Math.max(20, termWidth - 10);
-        const videoHeight = Math.max(10, termHeight - 8); 
-        const frameByteSize = videoWidth * videoHeight;
-
-        const padLeft = Math.max(0, Math.floor((termWidth - videoWidth) / 2));
-        const padTop = Math.max(0, Math.floor((termHeight - videoHeight - 2) / 2));
+        const vidW      = Math.max(20, termW - 10);
+        const vidH      = Math.max(10, termH - 8);
+        const frameSize = vidW * vidH;
+        const padL      = Math.max(0, Math.floor((termW - vidW) / 2));
+        const leftPad   = ' '.repeat(padL);
 
         let frameQueue = [];
-        let framesPlayed = 0;
-        let currentSubtitles = [];
+        let frameCount = 0;
+        let subtitles  = [];
+        let ended      = false;
 
-        fetchSubtitles(videoInfo.url).then(subs => {
-            currentSubtitles = subs;
+        fetchSubtitles(video.url).then(subs => { subtitles = subs; });
+
+        ytDlpProc = spawn(YTDLP, [
+            '-f', 'worst[ext=mp4]/worst',
+            '-o', '-', '--quiet', '--no-exec',
+            ...YTDLP_BASE_ARGS,
+            video.url,
+        ], { shell: false, cwd: '/tmp' });
+
+        ytDlpProc.stderr.on('data', (d) => {
+            const msg = d.toString();
+            if (state === 'PLAYING' && msg.includes('ERROR:')) {
+                write(`\r\nErreur yt-dlp : ${msg.trim()}\r\nAppuyez sur Entrée.\r\n`);
+                stopPlayback();
+            }
         });
 
-        try {
-            currentYtDlp = spawn('yt-dlp', [
-                '-f', 'worst', 
-                '--quiet', '--no-warnings', '-o', '-', 
-                '--no-config', '--no-cache-dir', '--no-exec',
-                videoInfo.url
-            ], { shell: false, cwd: '/tmp' }); 
+        imgStream = new PassThrough();
 
-            currentYtDlp.stderr.on('data', (data) => {
-                if (state === 'PLAYING' && data.toString().includes('ERROR:')) {
-                    send(`\r\nBlocage YouTube : ${data.toString().trim()}\r\nAppuyez sur Entrée.\r\n`);
-                    stopVideo();
+        ffmpegProc = ffmpeg(ytDlpProc.stdout)
+            .fps(FPS)
+            .format('image2pipe')
+            .videoCodec('rawvideo')
+            .outputOptions([
+                '-pix_fmt', 'gray',
+                '-vf', `scale=iw:ih/2,scale=${vidW}:${vidH}:force_original_aspect_ratio=decrease,pad=${vidW}:${vidH}:-1:-1`,
+            ])
+            .on('error', (err) => {
+                if (state === 'PLAYING' && !err.message.includes('SIGKILL')) {
+                    write(`\r\nErreur ffmpeg : ${err.message}\r\nAppuyez sur Entrée.\r\n`);
+                    stopPlayback();
                 }
             });
 
-            const imageStream = new PassThrough();
+        ffmpegProc.pipe(imgStream);
 
-            currentFfmpeg = ffmpeg(currentYtDlp.stdout)
-                .fps(FPS)
-                .format('image2pipe')
-                .videoCodec('rawvideo')
-                .outputOptions([
-                    '-pix_fmt gray',
-                    '-vf', `scale=iw:ih/2,scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=decrease,pad=${videoWidth}:${videoHeight}:-1:-1`
-                ])
-                .on('error', (err) => {
-                    // Ignorer les erreurs silencieuses
-                });
+        let frameBuf = Buffer.alloc(0);
 
-            currentFfmpeg.pipe(imageStream);
+        imgStream.on('data', (chunk) => {
+            frameBuf = Buffer.concat([frameBuf, chunk]);
+            while (frameBuf.length >= frameSize) {
+                const pixels = frameBuf.subarray(0, frameSize);
+                frameBuf     = frameBuf.subarray(frameSize);
 
-            let frameBuffer = Buffer.alloc(0);
-
-            imageStream.on('data', (chunk) => {
-                frameBuffer = Buffer.concat([frameBuffer, chunk]);
-
-                while (frameBuffer.length >= frameByteSize) {
-                    const frameData = frameBuffer.subarray(0, frameByteSize);
-                    frameBuffer = frameBuffer.subarray(frameByteSize);
-
-                    let asciiFrame = '\r\n'.repeat(padTop); 
-                    for (let y = 0; y < videoHeight; y++) {
-                        asciiFrame += ' '.repeat(padLeft);
-                        for (let x = 0; x < videoWidth; x++) {
-                            const pixelVal = frameData[y * videoWidth + x];
-                            const charIndex = Math.floor((pixelVal / 255) * (ASCII_CHARS.length - 1));
-                            asciiFrame += ASCII_CHARS[charIndex];
-                        }
-                        asciiFrame += '\x1B[K\r\n';
+                let frame = '';
+                for (let y = 0; y < vidH; y++) {
+                    frame += leftPad;
+                    for (let x = 0; x < vidW; x++) {
+                        frame += ASCII_CHARS[Math.floor(pixels[y * vidW + x] / 255 * (ASCII_CHARS.length - 1))];
                     }
-                    
-                    frameQueue.push(asciiFrame);
-
-                    if (frameQueue.length > 60) {
-                        imageStream.pause();
-                    }
+                    frame += '\x1B[K\r\n';
                 }
-            });
+                frameQueue.push(frame);
+                if (frameQueue.length > MAX_FRAME_QUEUE) imgStream.pause();
+            }
+        });
 
-            playInterval = setInterval(() => {
-                if (socket.destroyed || !socket.writable) {
-                    stopVideo();
-                    socket.destroy();
-                    return;
-                }
+        imgStream.on('end', () => { ended = true; });
 
-                if (frameQueue.length > 0) {
-                    const frame = frameQueue.shift();
-                    framesPlayed++;
-                    
-                    const currentSeconds = framesPlayed / FPS;
-                    
-                    let subText = "";
-                    if (currentSubtitles.length > 0) {
-                        const activeSubs = currentSubtitles.filter(s => currentSeconds >= s.start && currentSeconds <= s.end);
-                        if (activeSubs.length > 0) {
-                            const activeSub = activeSubs[activeSubs.length - 1];
-                            subText = activeSub.text.replace(/\n/g, ' ').trim();
-                            if (subText.length > videoWidth) {
-                                subText = subText.substring(0, videoWidth - 3) + '...';
-                            }
-                        }
-                    }
-                    
-                    let subLine = '\x1B[K'; 
-                    if (subText) {
-                        const subPad = Math.max(0, Math.floor((videoWidth - subText.length) / 2));
-                        subLine = ' '.repeat(padLeft + subPad) + subText + '\x1B[K';
-                    }
+        playInterval = setInterval(() => {
+            if (socket.destroyed || !socket.writable) { stopPlayback(); return; }
 
-                    const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoInfo.isLive, videoWidth);
-                    const pBarLine = ' '.repeat(padLeft) + pBar + '\x1B[K';
-                    
-                    socket.write('\x1B[H' + frame + subLine + '\r\n' + pBarLine + '\r\n\x1B[J');
+            if (!frameQueue.length) {
+                if (ended) { stopPlayback(); showSearch(); }
+                return;
+            }
 
-                    if (frameQueue.length < 20 && imageStream.isPaused()) {
-                        imageStream.resume();
-                    }
-                }
-            }, FRAME_DELAY);
+            const frame = frameQueue.shift();
+            frameCount++;
+            const now = frameCount / FPS;
 
-        } catch (err) {
-            send(`\r\nErreur de lancement : ${err.message}\r\nAppuyez sur Entrée.\r\n`);
-            stopVideo();
-        }
+            // Find active subtitle
+            let subLine = '\x1B[K';
+            const activeSub = subtitles.filter(s => now >= s.start && now <= s.end).pop();
+            if (activeSub) {
+                const t   = activeSub.text.replace(/\n/g, ' ').trim().slice(0, vidW);
+                const pad = Math.max(0, Math.floor((vidW - t.length) / 2));
+                subLine   = leftPad + ' '.repeat(pad) + t + '\x1B[K';
+            }
+
+            const pbar = makeProgressBar(now, video.seconds, video.isLive, vidW);
+            write('\x1B[H' + frame + subLine + '\r\n' + leftPad + pbar + '\x1B[K\r\n\x1B[J');
+
+            if (frameQueue.length < MIN_FRAME_QUEUE && imgStream?.isPaused()) imgStream.resume();
+        }, FRAME_DELAY_MS);
     };
 
-    const handleDisconnect = () => {
-        stopVideo();
+    // ── Disconnect cleanup (fires exactly once via 'close') ────────────────────
+    socket.on('end', destroy); // force-close on remote FIN
+    socket.on('close', () => {
+        stopPlayback();
         activeConnections = Math.max(0, activeConnections - 1);
-        const currentIpCount = ipTracker.get(clientIp) || 1;
-        if (currentIpCount <= 1) {
-            ipTracker.delete(clientIp);
-        } else {
-            ipTracker.set(clientIp, currentIpCount - 1);
-        }
-    };
-
-    socket.on('end', () => { handleDisconnect(); socket.destroy(); });
-    socket.on('close', () => { handleDisconnect(); socket.destroy(); });
-    socket.on('error', () => { handleDisconnect(); socket.destroy(); });
+        const n = ipConnections.get(ip) || 1;
+        if (n <= 1) ipConnections.delete(ip);
+        else        ipConnections.set(ip, n - 1);
+    });
 });
+
+server.on('error', (err) => { console.error('[SERVEUR] Erreur fatale :', err.message); process.exit(1); });
 
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`=============================================`);
     console.log(` Serveur ATUBE en écoute sur le port ${PORT} `);
     console.log(`=============================================`);
-    
-    if (process.getuid && process.getuid() === 0) {
+
+    if (process.getuid?.() === 0) {
         try {
             process.env.HOME = '/tmp';
             process.chdir('/tmp');
-
-            process.setgid('nogroup'); 
+            process.setgid('nogroup');
             process.setuid('nobody');
-            console.log('✅ SÉCURITÉ : Privilèges root abandonnés avec succès.');
-            console.log('Le serveur tourne désormais en utilisateur restreint (nobody:nogroup).');
+            console.log('✅ Privilèges root abandonnés → nobody:nogroup');
         } catch (err) {
-            console.error('❌ ERREUR FATALE : Impossible de dégrader les privilèges.', err);
-            process.exit(1); 
+            console.error('❌ ERREUR FATALE : Impossible de réduire les privilèges :', err.message);
+            process.exit(1);
         }
     } else {
-        console.warn('⚠️ AVERTISSEMENT : Le script n\'est pas lancé en root.');
-        console.warn('L\'écoute sur le port 23 risque d\'échouer (permission denied).');
+        console.warn('⚠️  Non exécuté en root — port 23 risque d\'échouer.');
     }
 });
+
+process.on('uncaughtException',  (err)    => console.error('[uncaughtException]',  err.message));
+process.on('unhandledRejection', (reason) => console.error('[unhandledRejection]', reason));
