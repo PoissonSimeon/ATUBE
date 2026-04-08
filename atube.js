@@ -166,11 +166,14 @@ const server = net.createServer((socket) => {
         hideCursor();
         send('Mise en cache du flux via yt-dlp...\r\n');
 
-        // On adapte la résolution vidéo à la taille réelle du terminal de l'utilisateur
-        // On retire 1 en hauteur ET en largeur pour éviter le "retour à la ligne automatique" du terminal
-        const videoWidth = Math.max(20, termWidth - 1);
-        const videoHeight = Math.max(10, termHeight - 1); 
+        // On adapte la résolution vidéo avec des marges pour centrer et éviter le clignotement
+        const videoWidth = Math.max(20, termWidth - 10);
+        const videoHeight = Math.max(10, termHeight - 6); 
         const frameByteSize = videoWidth * videoHeight;
+
+        // Calcul dynamique des marges pour centrer la vidéo
+        const padLeft = Math.max(0, Math.floor((termWidth - videoWidth) / 2));
+        const padTop = Math.max(0, Math.floor((termHeight - videoHeight - 2) / 2));
 
         let frameQueue = [];
         let framesPlayed = 0;
@@ -196,7 +199,13 @@ const server = net.createServer((socket) => {
                 .size(`${videoWidth}x${videoHeight}`)
                 .format('image2pipe')
                 .videoCodec('rawvideo')
-                .outputOptions('-pix_fmt gray');
+                .outputOptions('-pix_fmt gray')
+                .on('error', (err) => {
+                    // On capture et ignore silencieusement l'erreur quand on coupe la vidéo de force
+                    if (err.message && !err.message.includes('SIGKILL')) {
+                        console.error('\r\nErreur interne FFmpeg:', err.message);
+                    }
+                });
 
             currentFfmpeg.pipe(imageStream);
 
@@ -209,14 +218,16 @@ const server = net.createServer((socket) => {
                     const frameData = frameBuffer.subarray(0, frameByteSize);
                     frameBuffer = frameBuffer.subarray(frameByteSize);
 
-                    let asciiFrame = '';
+                    let asciiFrame = '\r\n'.repeat(padTop); // Marge en haut
                     for (let y = 0; y < videoHeight; y++) {
+                        asciiFrame += ' '.repeat(padLeft); // Marge à gauche
                         for (let x = 0; x < videoWidth; x++) {
                             const pixelVal = frameData[y * videoWidth + x];
                             const charIndex = Math.floor((pixelVal / 255) * (ASCII_CHARS.length - 1));
                             asciiFrame += ASCII_CHARS[charIndex];
                         }
-                        asciiFrame += '\r\n';
+                        // \x1B[K nettoie la fin de la ligne pour éviter les artefacts visuels
+                        asciiFrame += '\x1B[K\r\n';
                     }
                     
                     frameQueue.push(asciiFrame);
@@ -235,11 +246,13 @@ const server = net.createServer((socket) => {
                     framesPlayed++;
                     
                     const currentSeconds = framesPlayed / FPS;
-                    // On donne videoWidth à la barre de progression pour qu'elle ne touche pas le bord non plus
-                    const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoWidth);
                     
-                    // On efface le caractère clignotant, on se replace en haut à gauche et on affiche l'image + la barre
-                    socket.write('\x1B[H' + frame + pBar);
+                    const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoWidth);
+                    const pBarLine = ' '.repeat(padLeft) + pBar + '\x1B[K';
+                    
+                    // \x1B[H : Curseur en haut à gauche
+                    // \x1B[J : Nettoie le bas de l'écran pour éliminer les restes de lignes sans clignoter
+                    socket.write('\x1B[H' + frame + pBarLine + '\r\n\x1B[J');
 
                     // Quand le tampon se vide, on réveille FFmpeg
                     if (frameQueue.length < 20 && imageStream.isPaused()) {
