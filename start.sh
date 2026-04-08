@@ -123,7 +123,7 @@ Restart=on-failure
 RestartSec=5
 
 PrivateTmp=true
-ProtectHome=true
+ProtectHome=false
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
