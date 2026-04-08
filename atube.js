@@ -27,7 +27,6 @@ const parseTime = (t) => {
 // --- Moteur de Recherche via yt-dlp ---
 const searchYoutube = (query) => {
     return new Promise((resolve, reject) => {
-        // On demande désormais 20 résultats pour permettre la pagination
         const searchProc = spawn('yt-dlp', [
             `ytsearch20:${query}`,
             '--dump-json',
@@ -179,7 +178,6 @@ const server = net.createServer((socket) => {
     let playInterval = null;
 
     const send = (msg) => {
-        // Sécurité : on ne tente d'écrire que si le socket est encore ouvert
         if (!socket.destroyed && socket.writable) {
             socket.write(msg);
         }
@@ -202,7 +200,6 @@ const server = net.createServer((socket) => {
         state = 'SEARCH';
     };
 
-    // Fonction d'affichage paginé
     const displayResults = () => {
         clear();
         const totalPages = Math.ceil(searchResults.length / 5);
@@ -213,7 +210,6 @@ const server = net.createServer((socket) => {
         
         for (let i = start; i < end; i++) {
             const v = searchResults[i];
-            // On affiche de 1 à 5 peu importe la page
             send(`[${i - start + 1}] ${v.title} (${v.timestamp})\r\n`);
         }
         
@@ -227,6 +223,15 @@ const server = net.createServer((socket) => {
     promptSearch();
 
     socket.on('data', async (rawBuffer) => {
+        // Option de sortie propre de secours
+        if (rawBuffer.includes(0x03) || rawBuffer.includes(0x04)) {
+            stopVideo();
+            showCursor();
+            send('\r\n\x1B[0mDéconnexion.\r\n');
+            setTimeout(() => socket.destroy(), 100); 
+            return;
+        }
+
         let pureData = Buffer.alloc(0);
         let i = 0;
         while (i < rawBuffer.length) {
@@ -319,7 +324,6 @@ const server = net.createServer((socket) => {
                     send('\b \b');
                 }
             } else {
-                // Sécurité : limite la saisie pour éviter de saturer la RAM
                 if (inputBuffer.length < 255) {
                     inputBuffer += str;
                     send(str);
@@ -384,12 +388,16 @@ const server = net.createServer((socket) => {
 
             const imageStream = new PassThrough();
 
+            // MAGIE FFMPEG: On réduit de moitié la hauteur d'abord (caractères de terminal), 
+            // on adapte avec conservation du ratio, et on remplit avec du noir (centrage automatique avec -1:-1)
             currentFfmpeg = ffmpeg(currentYtDlp.stdout)
                 .fps(FPS)
-                .size(`${videoWidth}x${videoHeight}`)
                 .format('image2pipe')
                 .videoCodec('rawvideo')
-                .outputOptions('-pix_fmt gray')
+                .outputOptions([
+                    '-pix_fmt gray',
+                    '-vf', `scale=iw:ih/2,scale=${videoWidth}:${videoHeight}:force_original_aspect_ratio=decrease,pad=${videoWidth}:${videoHeight}:-1:-1`
+                ])
                 .on('error', (err) => {
                     if (err.message && !err.message.includes('SIGKILL')) {
                         console.error('\r\nErreur interne FFmpeg:', err.message);
@@ -427,7 +435,6 @@ const server = net.createServer((socket) => {
             });
 
             playInterval = setInterval(() => {
-                // Détection d'un client déconnecté/figé avant l'envoi de chaque frame
                 if (socket.destroyed || !socket.writable) {
                     stopVideo();
                     socket.destroy();
@@ -461,7 +468,7 @@ const server = net.createServer((socket) => {
                     const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoWidth);
                     const pBarLine = ' '.repeat(padLeft) + pBar + '\x1B[K';
                     
-                    send('\x1B[H' + frame + subLine + '\r\n' + pBarLine + '\r\n\x1B[J');
+                    socket.write('\x1B[H' + frame + subLine + '\r\n' + pBarLine + '\r\n\x1B[J');
 
                     if (frameQueue.length < 20 && imageStream.isPaused()) {
                         imageStream.resume();
@@ -475,7 +482,6 @@ const server = net.createServer((socket) => {
         }
     };
 
-    // Robustesse du Socket : On gère agressivement toutes les fermetures intempestives
     socket.on('end', () => {
         stopVideo();
         socket.destroy();
@@ -487,7 +493,6 @@ const server = net.createServer((socket) => {
     });
 
     socket.on('error', (err) => {
-        // Un terminal qui se ferme brusquement génère une erreur ECONNRESET ou EPIPE. On stoppe tout immédiatement.
         stopVideo();
         socket.destroy();
     });
