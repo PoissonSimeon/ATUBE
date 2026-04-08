@@ -112,6 +112,8 @@ cat > "$SERVICE_FILE" <<EOF
 Description=ATUBE - YouTube ASCII Telnet Server
 After=network.target
 Wants=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
 [Service]
 Type=simple
@@ -120,8 +122,6 @@ ExecStart=${NODE_BIN} ${SCRIPT_DIR}/atube.js
 WorkingDirectory=/tmp
 Restart=on-failure
 RestartSec=5
-StartLimitBurst=5
-StartLimitIntervalSec=60
 
 PrivateTmp=true
 ProtectHome=true
