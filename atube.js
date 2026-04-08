@@ -137,7 +137,30 @@ const fetchSubtitles = async (url) => {
 
                         // On nettoie les sous-titres devenus complètement vides
                         const finalParsed = parsed.filter(sub => sub.text.trim().length > 0);
-                        return resolve(finalParsed);
+                        
+                        // --- REGROUPEMENT (CHUNKING) DES SOUS-TITRES ---
+                        // Pour éviter que le texte ne défile trop vite mot par mot, on fusionne
+                        // les blocs successifs pour former des phrases plus longues (max ~70 caractères).
+                        const groupedSubs = [];
+                        if (finalParsed.length > 0) {
+                            let currentGroup = { ...finalParsed[0] };
+                            for (let i = 1; i < finalParsed.length; i++) {
+                                const nextSub = finalParsed[i];
+                                const gap = nextSub.start - currentGroup.end;
+                                
+                                // Si le texte fusionné fait moins de 70 caractères et que la pause entre les 2 est courte (< 1.5s)
+                                if (gap < 1.5 && (currentGroup.text.length + nextSub.text.length) < 70) {
+                                    currentGroup.text += ' ' + nextSub.text;
+                                    currentGroup.end = Math.max(currentGroup.end, nextSub.end);
+                                } else {
+                                    groupedSubs.push(currentGroup);
+                                    currentGroup = { ...nextSub };
+                                }
+                            }
+                            groupedSubs.push(currentGroup);
+                        }
+
+                        return resolve(groupedSubs);
                     }
                 }
             } catch(e) {
@@ -181,6 +204,15 @@ const server = net.createServer((socket) => {
     promptSearch();
 
     socket.on('data', async (rawBuffer) => {
+        // --- Détection de Ctrl+C (0x03) ou Ctrl+D (0x04) ---
+        if (rawBuffer.includes(0x03) || rawBuffer.includes(0x04)) {
+            stopVideo();
+            showCursor(); // On restaure le curseur avant de quitter
+            send('\r\n\x1B[0mDéconnexion demandée. Au revoir !\r\n');
+            socket.end();
+            return;
+        }
+
         let pureData = Buffer.alloc(0);
         let i = 0;
         while (i < rawBuffer.length) {
