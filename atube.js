@@ -53,7 +53,7 @@ const searchYoutube = (query) => {
             '--default-search', 'ytsearch',
             '--no-playlist',
             '--no-config', '--no-cache-dir' // Sécurité : pas de lecture de fichiers locaux
-        ], { shell: false });
+        ], { shell: false, cwd: '/tmp' }); // CORRECTION : Forcer l'exécution dans /tmp
         
         let out = '';
         searchProc.stdout.on('data', d => out += d.toString());
@@ -81,7 +81,7 @@ const fetchSubtitles = async (url) => {
     return new Promise((resolve) => {
         const process = spawn('yt-dlp', [
             '-J', '--skip-download', '--no-config', '--no-cache-dir', url
-        ], { shell: false });
+        ], { shell: false, cwd: '/tmp' }); // CORRECTION : Forcer l'exécution dans /tmp
         
         let out = '';
         process.stdout.on('data', d => out += d.toString());
@@ -445,7 +445,7 @@ const server = net.createServer((socket) => {
                 '--quiet', '--no-warnings', '-o', '-', 
                 '--no-config', '--no-cache-dir', '--no-exec',
                 videoInfo.url
-            ], { shell: false });
+            ], { shell: false, cwd: '/tmp' }); // CORRECTION : Forcer l'exécution dans /tmp
 
             currentYtDlp.stderr.on('data', (data) => {
                 if (state === 'PLAYING' && data.toString().includes('ERROR:')) {
@@ -575,6 +575,10 @@ server.listen(PORT, () => {
     // Mais on abandonne immédiatement les droits root pour sécuriser ton Proxmox.
     if (process.getuid && process.getuid() === 0) {
         try {
+            // CORRECTION : On doit sortir du dossier /root AVANT de perdre les privilèges
+            // car l'utilisateur 'nobody' n'a absolument pas le droit d'exister dans /root.
+            process.chdir('/tmp');
+
             // "nobody" et "nogroup" sont les utilisateurs avec le moins de droits sous Linux
             process.setgid('nogroup'); 
             process.setuid('nobody');
