@@ -45,6 +45,12 @@ const server = net.createServer((socket) => {
 
         // Si l'utilisateur tape Entrée
         if (str.includes('\n') || str.includes('\r')) {
+            // Sépare le texte envoyé d'un coup (Line mode) du saut de ligne
+            const parts = str.split(/[\r\n]+/);
+            if (parts[0]) {
+                inputBuffer += parts[0];
+            }
+
             const query = inputBuffer.trim();
             inputBuffer = ''; // Reset du buffer
 
