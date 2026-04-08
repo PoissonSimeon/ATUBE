@@ -31,7 +31,7 @@ const server = net.createServer((socket) => {
         showCursor();
         clear();
         send('================================================================================\r\n');
-        send('                              *** ASCIITUBE *** \r\n');
+        send('                                *** ATUBE *** \r\n');
         send('                      YouTube directement dans ton CLI                          \r\n');
         send('================================================================================\r\n\r\n');
         send('Entrez votre recherche YouTube (ou "quit" pour quitter) : ');
@@ -185,7 +185,7 @@ const server = net.createServer((socket) => {
 
 server.listen(PORT, () => {
     console.log(`=============================================`);
-    console.log(` Serveur ASCIITUBE en écoute sur le port ${PORT} `);
+    console.log(` Serveur ATUBE en écoute sur le port ${PORT} `);
     console.log(`=============================================`);
     console.log(`Testez-le avec la commande : telnet localhost ${PORT}`);
 });
