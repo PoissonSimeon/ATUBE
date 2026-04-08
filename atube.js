@@ -27,8 +27,9 @@ const parseTime = (t) => {
 // --- Moteur de Recherche via yt-dlp ---
 const searchYoutube = (query) => {
     return new Promise((resolve, reject) => {
+        // On demande désormais 20 résultats pour permettre la pagination
         const searchProc = spawn('yt-dlp', [
-            `ytsearch5:${query}`,
+            `ytsearch20:${query}`,
             '--dump-json',
             '--default-search', 'ytsearch',
             '--no-playlist'
@@ -66,7 +67,6 @@ const fetchSubtitles = async (url) => {
                 const subs = info.subtitles || {};
                 const autoSubs = info.automatic_captions || {};
                 
-                // Priorité au Français, sinon Anglais
                 let subTrack = subs['fr'] || subs['fr-FR'] || subs['en'] || subs['en-US'];
                 if (!subTrack && Object.keys(subs).length > 0) subTrack = subs[Object.keys(subs)[0]];
                 
@@ -103,8 +103,6 @@ const fetchSubtitles = async (url) => {
                         }
                         if (currentSub) parsed.push(currentSub);
 
-                        // --- ALGORITHME DE DÉDUPLICATION (ANTI-ROLLING) ---
-                        // YouTube répète les phrases dans ses auto-captions. On va supprimer ces répétitions.
                         parsed.forEach(sub => sub.originalText = sub.text);
 
                         for (let i = 1; i < parsed.length; i++) {
@@ -114,7 +112,6 @@ const fetchSubtitles = async (url) => {
                             let maxOverlapWords = 0;
                             let maxSearch = Math.min(prevWords.length, currWords.length);
 
-                            // Cherche le plus grand suffixe commun (fin du précédent = début de l'actuel)
                             for (let j = 1; j <= maxSearch; j++) {
                                 let match = true;
                                 for (let k = 0; k < j; k++) {
@@ -128,19 +125,14 @@ const fetchSubtitles = async (url) => {
                                 }
                             }
 
-                            // Si on trouve une superposition, on coupe l'ancienne partie du texte actuel
                             if (maxOverlapWords > 0) {
                                 currWords.splice(0, maxOverlapWords);
                                 parsed[i].text = currWords.join(' ');
                             }
                         }
 
-                        // On nettoie les sous-titres devenus complètement vides
                         const finalParsed = parsed.filter(sub => sub.text.trim().length > 0);
                         
-                        // --- REGROUPEMENT (CHUNKING) DES SOUS-TITRES ---
-                        // Pour éviter que le texte ne défile trop vite mot par mot, on fusionne
-                        // les blocs successifs pour former des phrases plus longues (max ~70 caractères).
                         const groupedSubs = [];
                         if (finalParsed.length > 0) {
                             let currentGroup = { ...finalParsed[0] };
@@ -148,7 +140,6 @@ const fetchSubtitles = async (url) => {
                                 const nextSub = finalParsed[i];
                                 const gap = nextSub.start - currentGroup.end;
                                 
-                                // Si le texte fusionné fait moins de 70 caractères et que la pause entre les 2 est courte (< 1.5s)
                                 if (gap < 1.5 && (currentGroup.text.length + nextSub.text.length) < 70) {
                                     currentGroup.text += ' ' + nextSub.text;
                                     currentGroup.end = Math.max(currentGroup.end, nextSub.end);
@@ -179,11 +170,21 @@ const server = net.createServer((socket) => {
     let searchResults = [];
     let inputBuffer = '';
     
+    // Variables pour la pagination
+    let lastQuery = '';
+    let currentPage = 0;
+    
     let currentFfmpeg = null;
     let currentYtDlp = null;
     let playInterval = null;
 
-    const send = (msg) => socket.write(msg);
+    const send = (msg) => {
+        // Sécurité : on ne tente d'écrire que si le socket est encore ouvert
+        if (!socket.destroyed && socket.writable) {
+            socket.write(msg);
+        }
+    };
+    
     const clear = () => send('\x1B[2J\x1B[H');
     const hideCursor = () => send('\x1B[?25l');
     const showCursor = () => send('\x1B[?25h');
@@ -201,15 +202,38 @@ const server = net.createServer((socket) => {
         state = 'SEARCH';
     };
 
+    // Fonction d'affichage paginé
+    const displayResults = () => {
+        clear();
+        const totalPages = Math.ceil(searchResults.length / 5);
+        send(`Résultats pour : "${lastQuery}" (Page ${currentPage + 1}/${totalPages})\r\n\r\n`);
+        
+        const start = currentPage * 5;
+        const end = Math.min(start + 5, searchResults.length);
+        
+        for (let i = start; i < end; i++) {
+            const v = searchResults[i];
+            // On affiche de 1 à 5 peu importe la page
+            send(`[${i - start + 1}] ${v.title} (${v.timestamp})\r\n`);
+        }
+        
+        send('\r\n');
+        if (end < searchResults.length) send('[n] Page suivante\r\n');
+        if (currentPage > 0) send('[p] Page précédente\r\n');
+        send('[0] Nouvelle recherche\r\n\r\n');
+        send('Choisissez une option : ');
+    };
+
     promptSearch();
 
     socket.on('data', async (rawBuffer) => {
         // --- Détection de Ctrl+C (0x03) ou Ctrl+D (0x04) ---
         if (rawBuffer.includes(0x03) || rawBuffer.includes(0x04)) {
             stopVideo();
-            showCursor(); // On restaure le curseur avant de quitter
+            showCursor();
             send('\r\n\x1B[0mDéconnexion demandée. Au revoir !\r\n');
-            socket.end();
+            // On utilise destroy() pour tuer le socket instantanément (rend la main au client CLI)
+            setTimeout(() => socket.destroy(), 100); 
             return;
         }
 
@@ -250,7 +274,7 @@ const server = net.createServer((socket) => {
 
             if (query.toLowerCase() === 'quit' || query.toLowerCase() === 'exit') {
                 send('\r\nAu revoir !\r\n');
-                socket.end();
+                socket.destroy();
                 return;
             }
 
@@ -259,27 +283,43 @@ const server = net.createServer((socket) => {
                 send('\r\n\r\nRecherche en cours pour "' + query + '"...\r\n');
                 try {
                     searchResults = await searchYoutube(query);
+                    lastQuery = query;
+                    currentPage = 0;
                     
-                    clear();
-                    send('Résultats pour : ' + query + '\r\n\r\n');
-                    searchResults.forEach((v, i) => {
-                        send(`[${i + 1}] ${v.title} (${v.timestamp})\r\n`);
-                    });
-                    send('\r\n[0] Nouvelle recherche\r\n');
-                    send('\r\nChoisissez un numéro : ');
-                    state = 'SELECT';
+                    if (searchResults.length > 0) {
+                        state = 'SELECT';
+                        displayResults();
+                    } else {
+                        send('\r\nAucun résultat trouvé. Appuyez sur Entrée pour réessayer.\r\n');
+                        state = 'SEARCH';
+                    }
                 } catch (e) {
                     send('\r\nErreur lors de la recherche. Appuyez sur Entrée pour réessayer.\r\n');
                     state = 'SEARCH';
                 }
             } else if (state === 'SELECT') {
-                const choice = parseInt(query);
-                if (choice === 0) {
+                const qLower = query.toLowerCase();
+                
+                if (query === '0') {
                     promptSearch();
-                } else if (choice > 0 && choice <= searchResults.length) {
-                    playVideo(searchResults[choice - 1]);
+                } else if ((qLower === 'n' || qLower === 'next') && (currentPage + 1) * 5 < searchResults.length) {
+                    currentPage++;
+                    displayResults();
+                } else if ((qLower === 'p' || qLower === 'prev') && currentPage > 0) {
+                    currentPage--;
+                    displayResults();
                 } else {
-                    send('\r\nChoix invalide. Choisissez un numéro (0-5) : ');
+                    const choice = parseInt(query);
+                    if (choice >= 1 && choice <= 5) {
+                        const absIndex = currentPage * 5 + (choice - 1);
+                        if (absIndex < searchResults.length) {
+                            playVideo(searchResults[absIndex]);
+                        } else {
+                            send('\r\nChoix invalide. Choisissez une option : ');
+                        }
+                    } else {
+                        send('\r\nChoix invalide. Choisissez une option : ');
+                    }
                 }
             }
         } else {
@@ -394,16 +434,21 @@ const server = net.createServer((socket) => {
             });
 
             playInterval = setInterval(() => {
+                // Détection d'un client déconnecté/figé avant l'envoi de chaque frame
+                if (socket.destroyed || !socket.writable) {
+                    stopVideo();
+                    socket.destroy();
+                    return;
+                }
+
                 if (frameQueue.length > 0) {
                     const frame = frameQueue.shift();
                     framesPlayed++;
                     
                     const currentSeconds = framesPlayed / FPS;
                     
-                    // --- Affichage des sous-titres ---
                     let subText = "";
                     if (currentSubtitles.length > 0) {
-                        // On prend systématiquement le bloc LE PLUS RÉCENT pour une coupure nette de l'ancien
                         const activeSubs = currentSubtitles.filter(s => currentSeconds >= s.start && currentSeconds <= s.end);
                         if (activeSubs.length > 0) {
                             const activeSub = activeSubs[activeSubs.length - 1];
@@ -423,8 +468,7 @@ const server = net.createServer((socket) => {
                     const pBar = generateProgressBar(currentSeconds, videoInfo.seconds, videoWidth);
                     const pBarLine = ' '.repeat(padLeft) + pBar + '\x1B[K';
                     
-                    // Affichage final centré verticalement : Vidéo -> Sous-Titre -> Barre
-                    socket.write('\x1B[H' + frame + subLine + '\r\n' + pBarLine + '\r\n\x1B[J');
+                    send('\x1B[H' + frame + subLine + '\r\n' + pBarLine + '\r\n\x1B[J');
 
                     if (frameQueue.length < 20 && imageStream.isPaused()) {
                         imageStream.resume();
@@ -438,8 +482,22 @@ const server = net.createServer((socket) => {
         }
     };
 
-    socket.on('close', stopVideo);
-    socket.on('error', stopVideo);
+    // Robustesse du Socket : On gère agressivement toutes les fermetures intempestives
+    socket.on('end', () => {
+        stopVideo();
+        socket.destroy();
+    });
+
+    socket.on('close', () => {
+        stopVideo();
+        socket.destroy();
+    });
+
+    socket.on('error', (err) => {
+        // Un terminal qui se ferme brusquement génère une erreur ECONNRESET ou EPIPE. On stoppe tout immédiatement.
+        stopVideo();
+        socket.destroy();
+    });
 });
 
 server.listen(PORT, () => {
